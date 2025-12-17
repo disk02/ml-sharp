@@ -163,7 +163,28 @@ def predict_cli(
             LOGGER.info("Rendering trajectory to %s", output_video_path)
 
             metadata = SceneMetaData(intrinsics[0, 0].item(), (width, height), "linearRGB")
-            render_params = camera.TrajectoryParams(trajectory_type=trajectory)
+            valid_trajectories = ["rotate_forward", "rotate", "swipe", "shake"]
+            try:
+                trajectory_enum = camera.TrajectoryType[trajectory.upper()]
+                trajectory_value = getattr(trajectory_enum, "value", trajectory_enum)
+            except AttributeError:
+                trajectory_value = trajectory.lower()
+                trajectory_enum = trajectory_value
+                if trajectory_value not in valid_trajectories:
+                    raise click.BadParameter(
+                        f"Invalid trajectory '{trajectory}'. Valid values: {', '.join(valid_trajectories)}."
+                    ) from None
+            except KeyError as exc:
+                raise click.BadParameter(
+                    f"Invalid trajectory '{trajectory}'. Valid values: {', '.join(valid_trajectories)}."
+                ) from exc
+
+            params_kwargs = (
+                {"trajectory": trajectory_enum}
+                if "trajectory" in camera.TrajectoryParams.__dataclass_fields__
+                else {"type": trajectory_value}
+            )
+            render_params = camera.TrajectoryParams(**params_kwargs)
             render_gaussians(
                 gaussians=gaussians,
                 metadata=metadata,
