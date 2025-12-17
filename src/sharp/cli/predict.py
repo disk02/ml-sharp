@@ -20,7 +20,7 @@ from sharp.models import (
     RGBGaussianPredictor,
     create_predictor,
 )
-from sharp.utils import io
+from sharp.utils import camera, io
 from sharp.utils import logging as logging_utils
 from sharp.utils.gaussians import (
     Gaussians3D,
@@ -67,6 +67,16 @@ DEFAULT_MODEL_URL = "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh
     help="Whether to render trajectory for checkpoint.",
 )
 @click.option(
+    "--trajectory",
+    type=click.Choice(
+        ["rotate_forward", "rotate", "swipe", "shake"],
+        case_sensitive=False,
+    ),
+    default="rotate_forward",
+    show_default=True,
+    help="Camera trajectory to render when --render is set.",
+)
+@click.option(
     "--device",
     type=str,
     default="default",
@@ -78,6 +88,7 @@ def predict_cli(
     output_path: Path,
     checkpoint_path: Path,
     with_rendering: bool,
+    trajectory: str,
     device: str,
     verbose: bool,
 ):
@@ -152,7 +163,13 @@ def predict_cli(
             LOGGER.info("Rendering trajectory to %s", output_video_path)
 
             metadata = SceneMetaData(intrinsics[0, 0].item(), (width, height), "linearRGB")
-            render_gaussians(gaussians, metadata, output_video_path)
+            render_params = camera.TrajectoryParams(trajectory_type=trajectory)
+            render_gaussians(
+                gaussians=gaussians,
+                metadata=metadata,
+                output_path=output_video_path,
+                params=render_params,
+            )
 
 
 @torch.no_grad()
