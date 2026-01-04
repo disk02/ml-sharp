@@ -29,7 +29,7 @@ from sharp.utils.gaussians import (
     unproject_gaussians,
 )
 
-from .render import render_gaussians
+from sharp.rendering.gaussian_renderer import render_gaussians
 
 LOGGER = logging.getLogger(__name__)
 
