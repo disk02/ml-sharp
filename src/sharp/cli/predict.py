@@ -86,6 +86,12 @@ DEFAULT_MODEL_URL = "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh
     help="Which frame index to save for --sbs-image.",
 )
 @click.option(
+    "--save-ply/--no-save-ply",
+    default=None,
+    show_default=False,
+    help="Whether to save the predicted Gaussians as .ply.",
+)
+@click.option(
     "--device",
     type=str,
     default="default",
@@ -99,8 +105,10 @@ def predict_cli(
     with_rendering: bool,
     sbs_image: Path | None,
     sbs_image_frame: int,
+    save_ply: bool | None,
     device: str,
-    verbose: bool,):
+    verbose: bool,
+):
     """Predict Gaussians from input images."""
     logging_utils.configure(logging.DEBUG if verbose else logging.INFO)
 
@@ -164,34 +172,51 @@ def predict_cli(
         )
         gaussians = predict_image(gaussian_predictor, image, f_px, torch.device(device))
 
-        LOGGER.info("Saving 3DGS to %s", output_path)
-        save_ply(gaussians, f_px, (height, width), output_path / f"{image_path.stem}.ply")
+        if save_ply is None:
+            effective_save_ply = sbs_image is None
+        else:
+            effective_save_ply = bool(save_ply)
 
-        if with_rendering:
+        if effective_save_ply:
+            LOGGER.info("Saving 3DGS to %s", output_path)
+            save_ply(gaussians, f_px, (height, width), output_path / f"{image_path.stem}.ply")
+        else:
+            if save_ply is None and sbs_image is not None:
+                LOGGER.info(
+                    "Skipping .ply save because --sbs-image was requested (use --save-ply to override)."
+                )
+            else:
+                LOGGER.info("Skipping .ply save because --no-save-ply was requested.")
+
+        want_sbs_image = sbs_image is not None
+        want_video = with_rendering
+
+        # Determine SBS image output path (optional)
+        sbs_image_path: Path | None = None
+        if want_sbs_image:
+            sbs_out = Path(sbs_image)
+            # Support `--sbs-image` with no value: default to output directory
+            if sbs_out.name == "__AUTO__":
+                sbs_image_path = output_path / f"{image_path.stem}_sbs.png"
+            else:
+                # If a directory path is provided (no suffix), place an image per input
+                if sbs_out.suffix == "":
+                    sbs_image_path = sbs_out / f"{image_path.stem}_sbs.png"
+                else:
+                    # If multiple inputs are processed and a single file path is given, avoid overwrites
+                    if len(image_paths) > 1:
+                        sbs_image_path = sbs_out.with_name(
+                            f"{sbs_out.stem}_{image_path.stem}{sbs_out.suffix}"
+                        )
+                    else:
+                        sbs_image_path = sbs_out
+
+        if want_video or sbs_image_path is not None:
             output_video_path = (output_path / image_path.stem).with_suffix(".mp4")
-            LOGGER.info("Rendering trajectory to %s", output_video_path)
+            if want_video:
+                LOGGER.info("Rendering trajectory to %s", output_video_path)
 
             metadata = SceneMetaData(intrinsics[0, 0].item(), (width, height), "linearRGB")
-
-            # Determine SBS image output path (optional)
-            sbs_image_path: Path | None = None
-            if sbs_image is not None:
-                sbs_out = Path(sbs_image)
-                # Support `--sbs-image` with no value: default to output directory
-                if sbs_out.name == "__AUTO__":
-                    sbs_image_path = output_path / f"{image_path.stem}_sbs.png"
-                else:
-                    # If a directory path is provided (no suffix), place an image per input
-                    if sbs_out.suffix == "":
-                        sbs_image_path = sbs_out / f"{image_path.stem}_sbs.png"
-                    else:
-                        # If multiple inputs are processed and a single file path is given, avoid overwrites
-                        if len(image_paths) > 1:
-                            sbs_image_path = sbs_out.with_name(
-                                f"{sbs_out.stem}_{image_path.stem}{sbs_out.suffix}"
-                            )
-                        else:
-                            sbs_image_path = sbs_out
 
             render_gaussians(
                 gaussians=gaussians,
