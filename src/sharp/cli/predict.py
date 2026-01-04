@@ -156,6 +156,15 @@ def predict_cli(
 
     output_path.mkdir(exist_ok=True, parents=True)
 
+    want_sbs_image = sbs_image is not None
+    want_video = with_rendering
+    if save_ply is None and want_sbs_image:
+        effective_save_ply = False
+    elif save_ply is None and not want_sbs_image:
+        effective_save_ply = True
+    else:
+        effective_save_ply = bool(save_ply)
+
     for image_path in image_paths:
         LOGGER.info("Processing %s", image_path)
         image, _, f_px = io.load_rgb(image_path)
@@ -172,24 +181,16 @@ def predict_cli(
         )
         gaussians = predict_image(gaussian_predictor, image, f_px, torch.device(device))
 
-        if save_ply is None:
-            effective_save_ply = sbs_image is None
-        else:
-            effective_save_ply = bool(save_ply)
-
         if effective_save_ply:
             LOGGER.info("Saving 3DGS to %s", output_path)
             save_ply(gaussians, f_px, (height, width), output_path / f"{image_path.stem}.ply")
         else:
-            if save_ply is None and sbs_image is not None:
+            if save_ply is None and want_sbs_image:
                 LOGGER.info(
                     "Skipping .ply save because --sbs-image was requested (use --save-ply to override)."
                 )
             else:
                 LOGGER.info("Skipping .ply save because --no-save-ply was requested.")
-
-        want_sbs_image = sbs_image is not None
-        want_video = with_rendering
 
         # Determine SBS image output path (optional)
         sbs_image_path: Path | None = None
@@ -212,9 +213,12 @@ def predict_cli(
                         sbs_image_path = sbs_out
 
         if want_video or sbs_image_path is not None:
-            output_video_path = (output_path / image_path.stem).with_suffix(".mp4")
             if want_video:
+                output_video_path = (output_path / image_path.stem).with_suffix(".mp4")
                 LOGGER.info("Rendering trajectory to %s", output_video_path)
+            else:
+                # Placeholder path; render_gaussians will not write video when sbs_image_path is set.
+                output_video_path = (output_path / image_path.stem).with_suffix(".mp4")
 
             metadata = SceneMetaData(intrinsics[0, 0].item(), (width, height), "linearRGB")
 
