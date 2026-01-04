@@ -67,6 +67,25 @@ DEFAULT_MODEL_URL = "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh
     help="Whether to render trajectory for checkpoint.",
 )
 @click.option(
+    "--sbs-image",
+    type=click.Path(path_type=Path),
+    default=None,
+    flag_value="__AUTO__",
+    show_default=False,
+    help=(
+        "Optional path to save a single SBS frame image (PNG/JPG). "
+        "If provided without a value, saves to <output-path>/<image_stem>_sbs.png. "
+        "If a directory path is provided, saves <dir>/<image_stem>_sbs.png."
+    ),
+)
+@click.option(
+    "--sbs-image-frame",
+    type=int,
+    default=0,
+    show_default=True,
+    help="Which frame index to save for --sbs-image.",
+)
+@click.option(
     "--device",
     type=str,
     default="default",
@@ -78,9 +97,10 @@ def predict_cli(
     output_path: Path,
     checkpoint_path: Path,
     with_rendering: bool,
+    sbs_image: Path | None,
+    sbs_image_frame: int,
     device: str,
-    verbose: bool,
-):
+    verbose: bool,):
     """Predict Gaussians from input images."""
     logging_utils.configure(logging.DEBUG if verbose else logging.INFO)
 
@@ -152,7 +172,34 @@ def predict_cli(
             LOGGER.info("Rendering trajectory to %s", output_video_path)
 
             metadata = SceneMetaData(intrinsics[0, 0].item(), (width, height), "linearRGB")
-            render_gaussians(gaussians, metadata, output_video_path)
+
+            # Determine SBS image output path (optional)
+            sbs_image_path: Path | None = None
+            if sbs_image is not None:
+                sbs_out = Path(sbs_image)
+                # Support `--sbs-image` with no value: default to output directory
+                if sbs_out.name == "__AUTO__":
+                    sbs_image_path = output_path / f"{image_path.stem}_sbs.png"
+                else:
+                    # If a directory path is provided (no suffix), place an image per input
+                    if sbs_out.suffix == "":
+                        sbs_image_path = sbs_out / f"{image_path.stem}_sbs.png"
+                    else:
+                        # If multiple inputs are processed and a single file path is given, avoid overwrites
+                        if len(image_paths) > 1:
+                            sbs_image_path = sbs_out.with_name(
+                                f"{sbs_out.stem}_{image_path.stem}{sbs_out.suffix}"
+                            )
+                        else:
+                            sbs_image_path = sbs_out
+
+            render_gaussians(
+                gaussians=gaussians,
+                metadata=metadata,
+                output_path=output_video_path,
+                sbs_image_path=sbs_image_path,
+                sbs_image_frame=sbs_image_frame,
+            )
 
 
 @torch.no_grad()

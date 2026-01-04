@@ -15,7 +15,7 @@ import torch
 from .gaussians import Gaussians3D
 from .linalg import eyes
 
-TrajetoryType = Literal["swipe", "shake", "rotate", "rotate_forward"]
+TrajetoryType = Literal["swipe", "shake", "rotate", "rotate_forward", "static"]
 LookAtMode = Literal["point", "ahead"]
 
 
@@ -78,6 +78,13 @@ def create_eye_trajectory(
     f_px: float,
 ) -> list[torch.Tensor]:
     """Create eye trajectory for trajectory type."""
+    # Handle static trajectory first to avoid expensive depth computations
+    if params.type == "static":
+        return create_eye_trajectory_static(
+            params.distance_m
+        )
+    
+    # Only compute max_offset for non-static trajectories
     max_offset_xyz_m = compute_max_offset(
         scene,
         params,
@@ -198,6 +205,20 @@ def create_eye_trajectory_rotate_forward(
     ]
 
     return eye_positions
+
+
+def create_eye_trajectory_static(
+    distance_m: float,
+) -> list[torch.Tensor]:
+    """Create a static trajectory at the canonical center.
+    
+    Returns a single position at [0, 0, distance_m] which is the canonical center.
+    This is used for SBS image rendering where we only need one static view.
+    """
+    # Single position at the center: [0, 0, distance_m]
+    eye_position = torch.tensor([0.0, 0.0, distance_m], dtype=torch.float32)
+    # Return a list with just one position
+    return [eye_position]
 
 
 def create_camera_model(
