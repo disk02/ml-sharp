@@ -20,6 +20,7 @@ from sharp.models import (
     RGBGaussianPredictor,
     create_predictor,
 )
+from sharp.utils.depth_io import load_depth, resolve_depth_for_image
 from sharp.utils import io
 from sharp.utils import logging as logging_utils
 from sharp.utils.gaussians import (
@@ -97,6 +98,33 @@ DEFAULT_MODEL_URL = "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh
     default="default",
     help="Device to run on. ['cpu', 'mps', 'cuda']",
 )
+@click.option(
+    "--depth-path",
+    type=click.Path(path_type=Path, exists=True),
+    default=None,
+    help="Optional path to a depth file or directory containing depth maps.",
+)
+@click.option(
+    "--depth-format",
+    type=click.Choice(["meters", "disparity"]),
+    default="meters",
+    show_default=True,
+    help="Depth input format for --depth-path.",
+)
+@click.option(
+    "--depth-scale",
+    type=float,
+    default=1.0,
+    show_default=True,
+    help="Scale factor applied to loaded depth values.",
+)
+@click.option(
+    "--depth-fill",
+    type=click.Choice(["override_only", "monodepth_fallback"]),
+    default="override_only",
+    show_default=True,
+    help="How to fill invalid depth override pixels.",
+)
 @click.option("-v", "--verbose", is_flag=True, help="Activate debug logs.")
 def predict_cli(
     input_path: Path,
@@ -107,9 +135,23 @@ def predict_cli(
     sbs_image_frame: int,
     save_ply: bool | None,
     device: str,
+    depth_path: Path | None,
+    depth_format: str,
+    depth_scale: float,
+    depth_fill: str,
     verbose: bool,
 ):
     """Predict Gaussians from input images."""
+    # Depth override examples:
+    # images/
+    #   img_0001.jpg
+    #   img_0002.jpg
+    # depth/
+    #   img_0001.png   (uint16, mm; use --depth-scale 0.001)
+    #   img_0002.png
+    #
+    # sharp predict --input-path images --depth-path depth --depth-format meters --depth-scale 0.001
+    # sharp predict --input-path images --depth-path depth --depth-format disparity
     logging_utils.configure(logging.DEBUG if verbose else logging.INFO)
 
     extensions = io.get_supported_image_extensions()
@@ -127,6 +169,12 @@ def predict_cli(
         return
 
     LOGGER.info("Processing %d valid image files.", len(image_paths))
+    if depth_path is not None:
+        if depth_path.is_file() and len(image_paths) > 1:
+            raise click.UsageError(
+                f"--depth-path {depth_path} is a file but multiple images were found."
+            )
+        LOGGER.info("Depth override enabled (%s).", depth_format)
 
     if device == "default":
         if torch.cuda.is_available():
@@ -179,7 +227,25 @@ def predict_cli(
             device=device,
             dtype=torch.float32,
         )
-        gaussians = predict_image(gaussian_predictor, image, f_px, torch.device(device))
+        depth_override = None
+        if depth_path is not None:
+            depth_file = (
+                depth_path
+                if depth_path.is_file()
+                else resolve_depth_for_image(image_path, depth_path)
+            )
+            depth_override = load_depth(depth_file, depth_scale)
+            LOGGER.info("Loaded depth override from %s", depth_file)
+
+        gaussians = predict_image(
+            gaussian_predictor,
+            image,
+            f_px,
+            torch.device(device),
+            depth_override=depth_override,
+            depth_override_is_disparity=(depth_format == "disparity"),
+            depth_override_fill_mode=depth_fill,
+        )
 
         if effective_save_ply:
             LOGGER.info("Saving 3DGS to %s", output_path)
@@ -237,6 +303,9 @@ def predict_image(
     image: np.ndarray,
     f_px: float,
     device: torch.device,
+    depth_override: np.ndarray | None = None,
+    depth_override_is_disparity: bool = False,
+    depth_override_fill_mode: str = "override_only",
 ) -> Gaussians3D:
     """Predict Gaussians from an image."""
     internal_shape = (1536, 1536)
@@ -255,7 +324,19 @@ def predict_image(
 
     # Predict Gaussians in the NDC space.
     LOGGER.info("Running inference.")
-    gaussians_ndc = predictor(image_resized_pt, disparity_factor)
+    depth_override_pt = None
+    if depth_override is not None:
+        depth_override_pt = torch.from_numpy(depth_override).to(device)
+        if depth_override_pt.dim() == 2:
+            depth_override_pt = depth_override_pt.unsqueeze(0)
+
+    gaussians_ndc = predictor(
+        image_resized_pt,
+        disparity_factor,
+        depth_override=depth_override_pt,
+        depth_override_is_disparity=depth_override_is_disparity,
+        depth_override_fill_mode=depth_override_fill_mode,
+    )
 
     LOGGER.info("Running postprocessing.")
     intrinsics = (
