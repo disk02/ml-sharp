@@ -180,9 +180,9 @@ def decompose_covariance_matrices(
             num_invalid,
         )
 
-    def _cpu_svd(covariances: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        rotations, singular_values_2, _ = torch.linalg.svd(covariances)
-        return rotations, singular_values_2
+    def _cpu_eigh(covariances: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        evals, evecs = torch.linalg.eigh(covariances)
+        return evals, evecs
 
     cpu_fallbacks = num_invalid
 
@@ -228,25 +228,25 @@ def decompose_covariance_matrices(
             failed_indices = _batched_eigh_chunked(failed_indices, chunk_size)
 
     if num_invalid > 0:
-        rotations_invalid, singular_values_invalid = _cpu_svd(
+        evals_invalid, evecs_invalid = _cpu_eigh(
             flat_covariances[~flat_mask].cpu().to(torch.float64)
         )
-        flat_evals[~flat_mask] = singular_values_invalid.to(
+        flat_evals[~flat_mask] = evals_invalid.to(
             device=device, dtype=covariance_matrices.dtype
         )
-        flat_evecs[~flat_mask] = rotations_invalid.to(
+        flat_evecs[~flat_mask] = evecs_invalid.to(
             device=device, dtype=covariance_matrices.dtype
         )
 
     if failed_indices.numel() > 0:
         cpu_fallbacks += int(failed_indices.numel())
-        rotations_failed, singular_values_failed = _cpu_svd(
+        evals_failed, evecs_failed = _cpu_eigh(
             flat_covariances[failed_indices].cpu().to(torch.float64)
         )
-        flat_evals[failed_indices] = singular_values_failed.to(
+        flat_evals[failed_indices] = evals_failed.to(
             device=device, dtype=covariance_matrices.dtype
         )
-        flat_evecs[failed_indices] = rotations_failed.to(
+        flat_evecs[failed_indices] = evecs_failed.to(
             device=device, dtype=covariance_matrices.dtype
         )
 
