@@ -200,3 +200,91 @@ def test_depth_override_kept_float32():
 
     assert init_model.last_depth is not None
     assert init_model.last_depth.dtype == torch.float32
+
+
+def test_depth_override_calibration_per_image_maps_to_monodepth():
+    image = torch.zeros(1, 3, 4, 4)
+    disparity = torch.full((1, 1, 8, 8), 2.0)
+    init_model = DummyInitModel()
+    predictor = RGBGaussianPredictor(
+        init_model=init_model,
+        monodepth_model=DummyMonodepth(disparity),
+        feature_model=DummyFeatureModel(),
+        prediction_head=DummyPredictionHead(),
+        gaussian_composer=DummyGaussianComposer(),
+        scale_map_estimator=DummyScaleMapEstimator(scale=2.0),
+    )
+
+    depth_override = torch.tensor(
+        [[[0.1, 0.5, 1.0, 0.25], [0.75, 0.2, 0.9, 0.3]]]
+    )
+    disparity_factor = torch.tensor([4.0])
+    predictor(
+        image=image,
+        disparity_factor=disparity_factor,
+        depth_override=depth_override,
+        depth_override_calibration="per_image",
+        depth_override_calibration_percentiles=(0.0, 100.0),
+    )
+
+    expected = torch.full((1, 1, 8, 8), 2.0)
+    torch.testing.assert_close(init_model.last_depth, expected)
+
+
+def test_depth_override_calibration_per_sequence_shared_transform():
+    image = torch.zeros(2, 3, 4, 4)
+    disparity = torch.full((2, 1, 8, 8), 2.0)
+    init_model = DummyInitModel()
+    predictor = RGBGaussianPredictor(
+        init_model=init_model,
+        monodepth_model=DummyMonodepth(disparity),
+        feature_model=DummyFeatureModel(),
+        prediction_head=DummyPredictionHead(),
+        gaussian_composer=DummyGaussianComposer(),
+        scale_map_estimator=DummyScaleMapEstimator(scale=2.0),
+    )
+
+    depth_override = torch.tensor(
+        [
+            [[0.1, 0.5], [1.0, 0.25]],
+            [[0.5, 1.0], [1.5, 0.75]],
+        ]
+    )
+    disparity_factor = torch.tensor([4.0, 4.0])
+    predictor(
+        image=image,
+        disparity_factor=disparity_factor,
+        depth_override=depth_override,
+        depth_override_calibration="per_sequence",
+        depth_override_calibration_percentiles=(0.0, 100.0),
+    )
+
+    expected = torch.full((2, 1, 8, 8), 2.0)
+    torch.testing.assert_close(init_model.last_depth, expected)
+
+
+def test_depth_override_calibration_skips_when_insufficient_valid():
+    image = torch.zeros(1, 3, 4, 4)
+    disparity = torch.full((1, 1, 2, 2), 2.0)
+    init_model = DummyInitModel()
+    predictor = RGBGaussianPredictor(
+        init_model=init_model,
+        monodepth_model=DummyMonodepth(disparity),
+        feature_model=DummyFeatureModel(),
+        prediction_head=DummyPredictionHead(),
+        gaussian_composer=DummyGaussianComposer(),
+        scale_map_estimator=DummyScaleMapEstimator(scale=2.0),
+    )
+
+    depth_override = torch.tensor([[[0.5]]])
+    disparity_factor = torch.tensor([4.0])
+    predictor(
+        image=image,
+        disparity_factor=disparity_factor,
+        depth_override=depth_override,
+        depth_override_calibration="per_image",
+        depth_override_calibration_percentiles=(0.0, 100.0),
+    )
+
+    expected = torch.full((1, 1, 2, 2), 0.5)
+    torch.testing.assert_close(init_model.last_depth, expected)

@@ -125,6 +125,20 @@ DEFAULT_MODEL_URL = "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh
     show_default=True,
     help="How to fill invalid depth override pixels.",
 )
+@click.option(
+    "--depth-calibration",
+    type=click.Choice(["none", "per_image", "per_sequence"]),
+    default="none",
+    show_default=True,
+    help="Optional calibration mode for normalized depth overrides.",
+)
+@click.option(
+    "--depth-calibration-percentiles",
+    type=(float, float),
+    default=(10.0, 90.0),
+    show_default=True,
+    help="Percentile range for depth override calibration.",
+)
 @click.option("-v", "--verbose", is_flag=True, help="Activate debug logs.")
 def predict_cli(
     input_path: Path,
@@ -139,6 +153,8 @@ def predict_cli(
     depth_format: str,
     depth_scale: float,
     depth_fill: str,
+    depth_calibration: str,
+    depth_calibration_percentiles: tuple[float, float],
     verbose: bool,
 ):
     """Predict Gaussians from input images."""
@@ -152,6 +168,8 @@ def predict_cli(
     #
     # sharp predict --input-path images --depth-path depth --depth-format meters --depth-scale 0.001
     # sharp predict --input-path images --depth-path depth --depth-format disparity
+    # sharp predict --input-path images --depth-path depth --depth-calibration per_image \
+    #   --depth-calibration-percentiles 10 90
     logging_utils.configure(logging.DEBUG if verbose else logging.INFO)
 
     extensions = io.get_supported_image_extensions()
@@ -245,6 +263,8 @@ def predict_cli(
             depth_override=depth_override,
             depth_override_is_disparity=(depth_format == "disparity"),
             depth_override_fill_mode=depth_fill,
+            depth_override_calibration=depth_calibration,
+            depth_override_calibration_percentiles=depth_calibration_percentiles,
         )
 
         if effective_save_ply:
@@ -306,6 +326,8 @@ def predict_image(
     depth_override: np.ndarray | None = None,
     depth_override_is_disparity: bool = False,
     depth_override_fill_mode: str = "override_only",
+    depth_override_calibration: str = "none",
+    depth_override_calibration_percentiles: tuple[float, float] = (10.0, 90.0),
 ) -> Gaussians3D:
     """Predict Gaussians from an image."""
     internal_shape = (1536, 1536)
@@ -336,6 +358,8 @@ def predict_image(
         depth_override=depth_override_pt,
         depth_override_is_disparity=depth_override_is_disparity,
         depth_override_fill_mode=depth_override_fill_mode,
+        depth_override_calibration=depth_override_calibration,
+        depth_override_calibration_percentiles=depth_override_calibration_percentiles,
     )
 
     LOGGER.info("Running postprocessing.")

@@ -112,6 +112,9 @@ class RGBGaussianPredictor(nn.Module):
         depth_override_fill_mode: Literal["override_only", "monodepth_fallback"] = (
             "override_only"
         ),
+        depth_override_calibration: Literal["none", "per_image", "per_sequence"] = "none",
+        depth_override_calibration_percentiles: tuple[float, float] = (10.0, 90.0),
+        depth_override_calibration_min_valid: float = 1e-6,
     ) -> Gaussians3D:
         """Predict 3D Gaussians.
 
@@ -122,6 +125,9 @@ class RGBGaussianPredictor(nn.Module):
             depth_override: External depth map to use instead of predicted monodepth.
             depth_override_is_disparity: Whether depth_override contains disparity values.
             depth_override_fill_mode: How to handle invalid override values.
+            depth_override_calibration: Optional calibration mode for normalized depth inputs.
+            depth_override_calibration_percentiles: Percentiles for robust calibration.
+            depth_override_calibration_min_valid: Minimum override value considered valid.
 
         Returns:
             The predicted 3D Gaussians.
@@ -215,11 +221,58 @@ class RGBGaussianPredictor(nn.Module):
             if depth_override_is_disparity:
                 depth_used = disparity_factor_f / depth_used.clamp(min=1e-4, max=1e4)
 
-            invalid_mask = (~torch.isfinite(depth_used)) | (depth_used <= 0)
-            if depth_override_fill_mode == "monodepth_fallback":
+            if depth_override_calibration != "none":
                 monodepth_f = disparity_factor_f / monodepth_disparity.float().clamp(
                     min=1e-4, max=1e4
                 )
+                p_lo, p_hi = depth_override_calibration_percentiles
+                if depth_override_calibration == "per_sequence":
+                    override_valid = torch.isfinite(depth_used) & (
+                        depth_used > depth_override_calibration_min_valid
+                    )
+                    ref_valid = torch.isfinite(monodepth_f) & (monodepth_f > 0)
+                    joint_valid = override_valid & ref_valid
+                    override_vals = depth_used[joint_valid]
+                    ref_vals = monodepth_f[joint_valid]
+                    if override_vals.numel() >= 32 and ref_vals.numel() >= 32:
+                        o_lo = torch.quantile(override_vals, p_lo / 100.0)
+                        o_hi = torch.quantile(override_vals, p_hi / 100.0)
+                        r_lo = torch.quantile(ref_vals, p_lo / 100.0)
+                        r_hi = torch.quantile(ref_vals, p_hi / 100.0)
+                        denom = torch.clamp(o_hi - o_lo, min=1e-6)
+                        a = (r_hi - r_lo) / denom
+                        b = r_lo - a * o_lo
+                        depth_used = torch.where(override_valid, a * depth_used + b, depth_used)
+                else:
+                    for batch_idx in range(depth_used.shape[0]):
+                        override_valid = torch.isfinite(depth_used[batch_idx]) & (
+                            depth_used[batch_idx] > depth_override_calibration_min_valid
+                        )
+                        ref_valid = torch.isfinite(monodepth_f[batch_idx]) & (
+                            monodepth_f[batch_idx] > 0
+                        )
+                        joint_valid = override_valid & ref_valid
+                        override_vals = depth_used[batch_idx][joint_valid]
+                        ref_vals = monodepth_f[batch_idx][joint_valid]
+                        if override_vals.numel() < 32 or ref_vals.numel() < 32:
+                            continue
+                        o_lo = torch.quantile(override_vals, p_lo / 100.0)
+                        o_hi = torch.quantile(override_vals, p_hi / 100.0)
+                        r_lo = torch.quantile(ref_vals, p_lo / 100.0)
+                        r_hi = torch.quantile(ref_vals, p_hi / 100.0)
+                        denom = torch.clamp(o_hi - o_lo, min=1e-6)
+                        a = (r_hi - r_lo) / denom
+                        b = r_lo - a * o_lo
+                        depth_used[batch_idx] = torch.where(
+                            override_valid, a * depth_used[batch_idx] + b, depth_used[batch_idx]
+                        )
+
+            invalid_mask = (~torch.isfinite(depth_used)) | (depth_used <= 0)
+            if depth_override_fill_mode == "monodepth_fallback":
+                if depth_override_calibration == "none":
+                    monodepth_f = disparity_factor_f / monodepth_disparity.float().clamp(
+                        min=1e-4, max=1e4
+                    )
                 depth_used = torch.where(invalid_mask, monodepth_f, depth_used)
             else:
                 eps = depth_used.new_tensor(1e-4)
