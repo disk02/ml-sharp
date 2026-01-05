@@ -212,7 +212,7 @@ def decompose_covariance_matrices(
     )
     if valid_indices.numel() > 0:
         chunk_size = 1024
-        LOGGER.warning(
+        LOGGER.debug(
             "Attempting batched EIGH on %d matrices with chunk_size=%d.",
             int(valid_indices.numel()),
             chunk_size,
@@ -275,40 +275,34 @@ def decompose_covariance_matrices(
     evecs = evecs.clone()
     evecs[..., :, -1] *= torch.where(mask[..., None], -1.0, 1.0).to(evecs.dtype)
 
-    sample_size = min(4096, mask.numel())
-    if sample_size > 0:
-        flat_mask = mask.reshape(-1)
-        sample = flat_mask[:sample_size]
-        frac_reflection = sample.float().mean().item()
-        if frac_reflection < 0.1 or frac_reflection > 0.9:
-            LOGGER.warning(
-                "Sampled reflection fraction is %.3f (K=%d).",
-                frac_reflection,
-                sample_size,
+    if LOGGER.isEnabledFor(logging.DEBUG):
+        sample_size = min(4096, mask.numel())
+        if sample_size > 0:
+            flat_mask = mask.reshape(-1)
+            num_samples = min(sample_size, flat_mask.numel())
+            sample_idx = torch.randint(
+                0, flat_mask.numel(), (num_samples,), device=flat_mask.device
             )
+            sample = flat_mask[sample_idx]
+            frac_reflection = sample.float().mean().item()
 
-        flat_evecs = evecs.reshape(-1, 3, 3)[:sample_size]
-        rt_r = flat_evecs.transpose(-1, -2) @ flat_evecs
-        ortho_err = (rt_r - eye3).abs().max().item()
-        ortho_warn_threshold = 1e-3
-        if ortho_err > ortho_warn_threshold:
-            LOGGER.warning(
-                "Sampled orthonormality max|RtR-I| is %.2e (K=%d).",
-                ortho_err,
-                sample_size,
-            )
+            flat_evecs = evecs.reshape(-1, 3, 3)[sample_idx]
+            rt_r = flat_evecs.transpose(-1, -2) @ flat_evecs
+            ortho_err = (rt_r - eye3).abs().max().item()
 
-        if LOGGER.isEnabledFor(logging.DEBUG):
             LOGGER.debug(
-                "Reflection fraction (sampled K=%d): %.3f",
-                sample_size,
+                "EIGH diagnostics (sampled k=%d): reflection_frac=%.3f ortho_max=%.2e",
+                num_samples,
                 frac_reflection,
-            )
-            LOGGER.debug(
-                "Orthonormality max|RtR-I| (sampled K=%d): %.2e",
-                sample_size,
                 ortho_err,
             )
+
+            if ortho_err > 1e-2:
+                LOGGER.warning(
+                    "Sampled orthonormality max|RtR-I| is %.2e (K=%d).",
+                    ortho_err,
+                    num_samples,
+                )
 
     quaternions = linalg.quaternions_from_rotation_matrices(evecs)
     quaternions = quaternions.to(dtype=dtype, device=device)
