@@ -7,9 +7,11 @@ Copyright (C) 2025 Apple Inc. All Rights Reserved.
 from __future__ import annotations
 
 import logging
+from typing import Literal
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from sharp.models.monodepth import MonodepthWithEncodingAdaptor
 from sharp.utils.gaussians import Gaussians3D
@@ -105,6 +107,11 @@ class RGBGaussianPredictor(nn.Module):
         image: torch.Tensor,
         disparity_factor: torch.Tensor,
         depth: torch.Tensor | None = None,
+        depth_override: torch.Tensor | None = None,
+        depth_override_is_disparity: bool = False,
+        depth_override_fill_mode: Literal["override_only", "monodepth_fallback"] = (
+            "override_only"
+        ),
     ) -> Gaussians3D:
         """Predict 3D Gaussians.
 
@@ -112,6 +119,9 @@ class RGBGaussianPredictor(nn.Module):
             image: The image to process.
             disparity_factor: Factor to convert depth to disparities.
             depth: Ground truth depth to align predicted depth to.
+            depth_override: External depth map to use instead of predicted monodepth.
+            depth_override_is_disparity: Whether depth_override contains disparity values.
+            depth_override_fill_mode: How to handle invalid override values.
 
         Returns:
             The predicted 3D Gaussians.
@@ -173,13 +183,47 @@ class RGBGaussianPredictor(nn.Module):
         # predictor. This way, the depth alignment submodule containing the conditional
         # logic can be excluded during the tracing and the graph of the predictors is
         # static.
-        monodepth, _ = self.depth_alignment(
-            monodepth,
-            depth,
-            monodepth_output.decoder_features,
-        )
+        if depth_override is not None:
+            depth_used = depth_override
+            if depth_used.dim() == 3:
+                depth_used = depth_used.unsqueeze(1)
+            if depth_used.dim() != 4 or depth_used.shape[1] != 1:
+                raise ValueError(
+                    "depth_override must have shape [B, 1, H, W] or [B, H, W]."
+                )
 
-        init_output = self.init_model(image, monodepth)
+            depth_used = depth_used.to(device=image.device, dtype=image.dtype)
+            depth_used = torch.nan_to_num(depth_used, nan=0.0, posinf=0.0, neginf=0.0)
+            if depth_used.shape[-2:] != monodepth_disparity.shape[-2:]:
+                depth_used = F.interpolate(
+                    depth_used,
+                    size=monodepth_disparity.shape[-2:],
+                    mode="nearest",
+                )
+
+            invalid_mask = depth_used <= 0
+            if depth_override_is_disparity:
+                depth_used = disparity_factor / depth_used.clamp(min=1e-4, max=1e4)
+
+            depth_used = depth_used.clamp(min=1e-4, max=1e4)
+            if depth_override_fill_mode == "monodepth_fallback":
+                depth_used = torch.where(invalid_mask, monodepth, depth_used)
+            else:
+                depth_used = torch.where(
+                    invalid_mask,
+                    torch.tensor(1e-4, device=depth_used.device, dtype=depth_used.dtype),
+                    depth_used,
+                )
+
+            init_output = self.init_model(image, depth_used)
+        else:
+            monodepth, _ = self.depth_alignment(
+                monodepth,
+                depth,
+                monodepth_output.decoder_features,
+            )
+
+            init_output = self.init_model(image, monodepth)
         image_features = self.feature_model(
             init_output.feature_input, encodings=monodepth_output.output_features
         )
