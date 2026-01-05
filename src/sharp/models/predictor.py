@@ -137,7 +137,8 @@ class RGBGaussianPredictor(nn.Module):
         monodepth_output = self.monodepth_model(image)
         monodepth_disparity = monodepth_output.disparity
 
-        disparity_factor = disparity_factor[:, None, None, None]
+        disparity_factor_base = disparity_factor
+        disparity_factor = disparity_factor_base[:, None, None, None]
         monodepth = disparity_factor / monodepth_disparity.clamp(min=1e-4, max=1e4)
 
         # In the model we apply additional alignment to provided ground truth depth
@@ -192,8 +193,11 @@ class RGBGaussianPredictor(nn.Module):
                     "depth_override must have shape [B, 1, H, W] or [B, H, W]."
                 )
 
-            depth_used = depth_used.to(device=image.device, dtype=image.dtype)
-            depth_used = torch.nan_to_num(depth_used, nan=0.0, posinf=0.0, neginf=0.0)
+            depth_used = depth_used.to(device=image.device)
+            if depth_used.dtype != torch.float32:
+                depth_used = depth_used.float()
+            zero = depth_used.new_tensor(0.0)
+            depth_used = torch.where(torch.isfinite(depth_used), depth_used, zero)
             if depth_used.shape[-2:] != monodepth_disparity.shape[-2:]:
                 depth_used = F.interpolate(
                     depth_used,
@@ -201,20 +205,21 @@ class RGBGaussianPredictor(nn.Module):
                     mode="nearest",
                 )
 
-            invalid_mask = depth_used <= 0
+            disparity_factor_f = disparity_factor_base.float()[:, None, None, None]
             if depth_override_is_disparity:
-                depth_used = disparity_factor / depth_used.clamp(min=1e-4, max=1e4)
+                depth_used = disparity_factor_f / depth_used.clamp(min=1e-4, max=1e4)
+
+            invalid_mask = (~torch.isfinite(depth_used)) | (depth_used <= 0)
+            if depth_override_fill_mode == "monodepth_fallback":
+                monodepth_f = disparity_factor_f / monodepth_disparity.float().clamp(
+                    min=1e-4, max=1e4
+                )
+                depth_used = torch.where(invalid_mask, monodepth_f, depth_used)
+            else:
+                eps = depth_used.new_tensor(1e-4)
+                depth_used = torch.where(invalid_mask, eps, depth_used)
 
             depth_used = depth_used.clamp(min=1e-4, max=1e4)
-            if depth_override_fill_mode == "monodepth_fallback":
-                depth_used = torch.where(invalid_mask, monodepth, depth_used)
-            else:
-                depth_used = torch.where(
-                    invalid_mask,
-                    torch.tensor(1e-4, device=depth_used.device, dtype=depth_used.dtype),
-                    depth_used,
-                )
-
             init_output = self.init_model(image, depth_used)
         else:
             monodepth, _ = self.depth_alignment(

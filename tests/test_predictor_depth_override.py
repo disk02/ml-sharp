@@ -92,15 +92,12 @@ def test_depth_override_used():
     )
 
     expected = depth_override.unsqueeze(1)
-    expected = torch.nan_to_num(expected, nan=0.0, posinf=0.0, neginf=0.0)
+    expected = expected.float()
+    expected = torch.where(torch.isfinite(expected), expected, expected.new_tensor(0.0))
     expected = F.interpolate(expected, size=(2, 2), mode="nearest")
-    invalid_mask = expected <= 0
+    invalid_mask = (~torch.isfinite(expected)) | (expected <= 0)
     expected = expected.clamp(min=1e-4, max=1e4)
-    expected = torch.where(
-        invalid_mask,
-        torch.tensor(1e-4, device=expected.device, dtype=expected.dtype),
-        expected,
-    )
+    expected = torch.where(invalid_mask, expected.new_tensor(1e-4), expected)
 
     torch.testing.assert_close(init_model.last_depth, expected)
 
@@ -126,3 +123,80 @@ def test_no_override_uses_depth_alignment():
     expected_monodepth = disparity_factor[:, None, None, None] / disparity
     expected = expected_monodepth * 3.0
     torch.testing.assert_close(init_model.last_depth, expected)
+
+
+def test_disparity_override_conversion():
+    image = torch.zeros(1, 3, 4, 4)
+    disparity = torch.ones(1, 1, 2, 2)
+    init_model = DummyInitModel()
+    predictor = RGBGaussianPredictor(
+        init_model=init_model,
+        monodepth_model=DummyMonodepth(disparity),
+        feature_model=DummyFeatureModel(),
+        prediction_head=DummyPredictionHead(),
+        gaussian_composer=DummyGaussianComposer(),
+        scale_map_estimator=DummyScaleMapEstimator(scale=2.0),
+    )
+
+    depth_override = torch.full((1, 4, 4), 2.0)
+    disparity_factor = torch.tensor([4.0])
+    predictor(
+        image=image,
+        disparity_factor=disparity_factor,
+        depth_override=depth_override,
+        depth_override_is_disparity=True,
+    )
+
+    expected = torch.full((1, 1, 2, 2), 2.0)
+    torch.testing.assert_close(init_model.last_depth, expected)
+
+
+def test_monodepth_fallback_replaces_invalid_pixels():
+    image = torch.zeros(1, 3, 4, 4)
+    disparity = torch.full((1, 1, 2, 2), 2.0)
+    init_model = DummyInitModel()
+    predictor = RGBGaussianPredictor(
+        init_model=init_model,
+        monodepth_model=DummyMonodepth(disparity),
+        feature_model=DummyFeatureModel(),
+        prediction_head=DummyPredictionHead(),
+        gaussian_composer=DummyGaussianComposer(),
+        scale_map_estimator=DummyScaleMapEstimator(scale=2.0),
+    )
+
+    depth_override = torch.tensor([[[1.0, 0.0], [-1.0, 4.0]]])
+    disparity_factor = torch.tensor([4.0])
+    predictor(
+        image=image,
+        disparity_factor=disparity_factor,
+        depth_override=depth_override,
+        depth_override_fill_mode="monodepth_fallback",
+    )
+
+    expected = torch.tensor([[[[1.0, 2.0], [2.0, 4.0]]]])
+    torch.testing.assert_close(init_model.last_depth, expected)
+
+
+def test_depth_override_kept_float32():
+    image = torch.zeros(1, 3, 4, 4, dtype=torch.float16)
+    disparity = torch.ones(1, 1, 2, 2)
+    init_model = DummyInitModel()
+    predictor = RGBGaussianPredictor(
+        init_model=init_model,
+        monodepth_model=DummyMonodepth(disparity),
+        feature_model=DummyFeatureModel(),
+        prediction_head=DummyPredictionHead(),
+        gaussian_composer=DummyGaussianComposer(),
+        scale_map_estimator=DummyScaleMapEstimator(scale=2.0),
+    )
+
+    depth_override = torch.full((1, 4, 4), 2.0, dtype=torch.float16)
+    disparity_factor = torch.tensor([4.0], dtype=torch.float16)
+    predictor(
+        image=image,
+        disparity_factor=disparity_factor,
+        depth_override=depth_override,
+    )
+
+    assert init_model.last_depth is not None
+    assert init_model.last_depth.dtype == torch.float32
