@@ -97,6 +97,20 @@ DEFAULT_MODEL_URL = "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh
     default="default",
     help="Device to run on. ['cpu', 'mps', 'cuda']",
 )
+@click.option(
+    "--amp/--no-amp",
+    "amp",
+    default=None,
+    show_default=False,
+    help="Enable automatic mixed precision on CUDA (default: enabled on CUDA).",
+)
+@click.option(
+    "--amp-dtype",
+    type=click.Choice(["fp16", "bf16"], case_sensitive=False),
+    default="fp16",
+    show_default=True,
+    help="Data type for CUDA AMP autocast.",
+)
 @click.option("-v", "--verbose", is_flag=True, help="Activate debug logs.")
 def predict_cli(
     input_path: Path,
@@ -107,6 +121,8 @@ def predict_cli(
     sbs_image_frame: int,
     save_ply: bool | None,
     device: str,
+    amp: bool | None,
+    amp_dtype: str,
     verbose: bool,
 ):
     """Predict Gaussians from input images."""
@@ -140,7 +156,27 @@ def predict_cli(
             device = "mps"
         else:
             device = "cpu"
-    LOGGER.info("Using device %s", device)
+
+    if device == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("high")
+
+    if amp is None:
+        amp = device == "cuda"
+    elif amp and device != "cuda":
+        LOGGER.warning("AMP is only supported on CUDA. Disabling AMP on %s.", device)
+        amp = False
+
+    amp_dtype_lower = amp_dtype.lower()
+    amp_autocast_dtype = torch.float16 if amp_dtype_lower == "fp16" else torch.bfloat16
+    LOGGER.info(
+        "Predict settings: device=%s amp=%s amp_dtype=%s",
+        device,
+        "enabled" if amp else "disabled",
+        amp_dtype_lower,
+    )
 
     if with_rendering and device != "cuda":
         LOGGER.warning("Can only run rendering with gsplat on CUDA. Rendering is disabled.")
@@ -187,7 +223,14 @@ def predict_cli(
             device=device,
             dtype=torch.float32,
         )
-        gaussians = predict_image(gaussian_predictor, image, f_px, torch.device(device))
+        gaussians = predict_image(
+            gaussian_predictor,
+            image,
+            f_px,
+            torch.device(device),
+            amp_enabled=amp,
+            amp_dtype=amp_autocast_dtype,
+        )
 
         if effective_save_ply:
             LOGGER.info("Saving 3DGS to %s", output_path)
@@ -246,12 +289,13 @@ def predict_cli(
             )
 
 
-@torch.no_grad()
 def predict_image(
     predictor: RGBGaussianPredictor,
     image: np.ndarray,
     f_px: float,
     device: torch.device,
+    amp_enabled: bool,
+    amp_dtype: torch.dtype,
 ) -> Gaussians3D:
     """Predict Gaussians from an image."""
     internal_shape = (1536, 1536)
@@ -270,9 +314,21 @@ def predict_image(
 
     # Predict Gaussians in the NDC space.
     LOGGER.info("Running inference.")
-    gaussians_ndc = predictor(image_resized_pt, disparity_factor)
+    with torch.inference_mode():
+        if amp_enabled and device.type == "cuda":
+            with torch.autocast(device_type="cuda", dtype=amp_dtype):
+                gaussians_ndc = predictor(image_resized_pt, disparity_factor)
+        else:
+            gaussians_ndc = predictor(image_resized_pt, disparity_factor)
 
     LOGGER.info("Running postprocessing.")
+    gaussians_ndc = Gaussians3D(
+        mean_vectors=gaussians_ndc.mean_vectors.float(),
+        singular_values=gaussians_ndc.singular_values.float(),
+        quaternions=gaussians_ndc.quaternions.float(),
+        colors=gaussians_ndc.colors.float(),
+        opacities=gaussians_ndc.opacities.float(),
+    )
     intrinsics = (
         torch.tensor(
             [
