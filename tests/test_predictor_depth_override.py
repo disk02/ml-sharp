@@ -318,7 +318,8 @@ def test_depth_override_calibration_multi_channel_disparity():
     )
 
     assert init_model.last_depth is not None
-    assert init_model.last_depth.shape == (1, 1, 8, 8)
+    assert init_model.last_depth.shape == (1, 2, 8, 8)
+    torch.testing.assert_close(init_model.last_depth[:, 0], init_model.last_depth[:, 1])
     assert torch.isfinite(init_model.last_depth).all()
 
 
@@ -347,5 +348,6 @@ def test_depth_override_fallback_multi_channel_disparity():
     )
 
     assert init_model.last_depth is not None
-    assert init_model.last_depth.shape == (1, 1, 2, 2)
+    assert init_model.last_depth.shape == (1, 2, 2, 2)
+    torch.testing.assert_close(init_model.last_depth[:, 0], init_model.last_depth[:, 1])
     assert torch.isfinite(init_model.last_depth).all()

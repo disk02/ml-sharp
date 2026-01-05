@@ -287,7 +287,13 @@ class RGBGaussianPredictor(nn.Module):
                 depth_used = torch.where(invalid_mask, eps, depth_used)
 
             depth_used = depth_used.clamp(min=1e-4, max=1e4)
-            init_output = self.init_model(image, depth_used)
+            expected_c = 1
+            if monodepth_disparity.dim() == 4:
+                expected_c = monodepth_disparity.shape[1]
+            depth_for_init = depth_used
+            if expected_c != depth_used.shape[1]:
+                depth_for_init = depth_used.repeat(1, expected_c, 1, 1)
+            init_output = self.init_model(image, depth_for_init)
         else:
             monodepth, _ = self.depth_alignment(
                 monodepth,
