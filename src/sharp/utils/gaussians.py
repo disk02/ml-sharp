@@ -148,24 +148,143 @@ def decompose_covariance_matrices(
     device = covariance_matrices.device
     dtype = covariance_matrices.dtype
 
-    # We convert to fp64 to avoid numerical errors.
-    covariance_matrices = covariance_matrices.detach().cpu().to(torch.float64)
-    rotations, singular_values_2, _ = torch.linalg.svd(covariance_matrices)
+    # Use symmetric eigendecomposition on-device to avoid CPU round-trips.
+    covariance_matrices = covariance_matrices.detach().to(torch.float32)
+    covariance_matrices = 0.5 * (
+        covariance_matrices + covariance_matrices.transpose(-1, -2)
+    )
+    finite_mask = torch.isfinite(covariance_matrices).all(dim=(-1, -2))
 
-    # NOTE: in SVD, it is possible that U and VT are both reflections.
-    # We need to correct them.
-    batch_idx, gaussian_idx = torch.where(torch.linalg.det(rotations) < 0)
-    num_reflections = len(gaussian_idx)
+    flat_covariances = covariance_matrices.reshape(-1, 3, 3)
+    flat_mask = finite_mask.reshape(-1)
+    flat_evals = torch.empty(
+        (flat_covariances.shape[0], 3),
+        device=covariance_matrices.device,
+        dtype=covariance_matrices.dtype,
+    )
+    flat_evecs = torch.empty(
+        (flat_covariances.shape[0], 3, 3),
+        device=covariance_matrices.device,
+        dtype=covariance_matrices.dtype,
+    )
+
+    num_invalid = int((~flat_mask).sum().item())
+    if num_invalid > 0:
+        LOGGER.warning(
+            "Received %d non-finite covariance matrices. Falling back to CPU for them.",
+            num_invalid,
+        )
+
+    def _cpu_eigh(covariances: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        evals, evecs = torch.linalg.eigh(covariances)
+        return evals, evecs
+
+    cpu_fallbacks = num_invalid
+
+    eye3 = torch.eye(
+        3, device=covariance_matrices.device, dtype=covariance_matrices.dtype
+    )
+
+    def _batched_eigh_chunked(
+        indices: torch.Tensor, chunk_size: int, jitter: float | None = None
+    ) -> torch.Tensor:
+        failed_chunks: list[torch.Tensor] = []
+        for i in range(0, indices.numel(), chunk_size):
+            chunk = indices[i : i + chunk_size]
+            try:
+                cov_chunk = flat_covariances[chunk]
+                if jitter is not None:
+                    cov_chunk = cov_chunk + jitter * eye3
+                evals_chunk, evecs_chunk = torch.linalg.eigh(cov_chunk)
+                flat_evals[chunk] = evals_chunk
+                flat_evecs[chunk] = evecs_chunk
+            except RuntimeError:
+                failed_chunks.append(chunk)
+        if not failed_chunks:
+            return torch.empty(
+                (0,), device=indices.device, dtype=indices.dtype
+            )
+        return torch.cat(failed_chunks, dim=0)
+
+    valid_indices = flat_mask.nonzero(as_tuple=False).flatten()
+    failed_indices = torch.empty(
+        (0,), device=valid_indices.device, dtype=valid_indices.dtype
+    )
+    if valid_indices.numel() > 0:
+        chunk_size = 1024
+        LOGGER.warning(
+            "Attempting batched EIGH on %d matrices with chunk_size=%d.",
+            int(valid_indices.numel()),
+            chunk_size,
+        )
+        failed_indices = _batched_eigh_chunked(valid_indices, chunk_size)
+        if failed_indices.numel() > 0:
+            chunk_size = max(16, chunk_size // 4)
+            LOGGER.warning(
+                "Retrying batched EIGH on %d matrices with chunk_size=%d.",
+                int(failed_indices.numel()),
+                chunk_size,
+            )
+            failed_indices = _batched_eigh_chunked(
+                failed_indices, chunk_size, jitter=1e-8
+            )
+
+    if num_invalid > 0:
+        evals_invalid, evecs_invalid = _cpu_eigh(
+            flat_covariances[~flat_mask].cpu().to(torch.float64)
+        )
+        flat_evals[~flat_mask] = evals_invalid.to(
+            device=device, dtype=covariance_matrices.dtype
+        )
+        flat_evecs[~flat_mask] = evecs_invalid.to(
+            device=device, dtype=covariance_matrices.dtype
+        )
+
+    if failed_indices.numel() > 0:
+        cpu_fallbacks += int(failed_indices.numel())
+        evals_failed, evecs_failed = _cpu_eigh(
+            flat_covariances[failed_indices].cpu().to(torch.float64)
+        )
+        flat_evals[failed_indices] = evals_failed.to(
+            device=device, dtype=covariance_matrices.dtype
+        )
+        flat_evecs[failed_indices] = evecs_failed.to(
+            device=device, dtype=covariance_matrices.dtype
+        )
+
+    if failed_indices.numel() > 0 or num_invalid > 0:
+        LOGGER.warning(
+            "Covariance decomposition fallbacks: failed_indices=%d cpu_fallbacks=%d",
+            int(failed_indices.numel()),
+            cpu_fallbacks,
+        )
+
+    evals = flat_evals.reshape(*covariance_matrices.shape[:-1])
+    evecs = flat_evecs.reshape(*covariance_matrices.shape)
+
+    # Sort eigenvalues descending (largest scale first) and reorder eigenvectors (columns).
+    sort_idx = evals.argsort(dim=-1, descending=True)
+    evals = evals.gather(-1, sort_idx)
+    evecs = evecs.gather(
+        -1, sort_idx.unsqueeze(-2).expand(*sort_idx.shape[:-1], 3, 3)
+    )
+
+    # NOTE: it is possible that eigenvectors form a reflection. Correct to rotation.
+    det = torch.linalg.det(evecs)
+    num_reflections = int((det < 0).sum().item())
     if num_reflections > 0:
         LOGGER.warning(
-            "Received %d reflection matrices from SVD. Flipping them to rotations.",
+            "Received %d reflection matrices from EIGH. Flipping them to rotations.",
             num_reflections,
         )
-        # Flip the last column of reflection and make it a rotation.
-        rotations[batch_idx, gaussian_idx, :, -1] *= -1
-    quaternions = linalg.quaternions_from_rotation_matrices(rotations)
+        evecs = evecs.clone()
+        evecs[..., :, -1] *= torch.where((det < 0)[..., None], -1.0, 1.0).to(
+            evecs.dtype
+        )
+
+    quaternions = linalg.quaternions_from_rotation_matrices(evecs)
     quaternions = quaternions.to(dtype=dtype, device=device)
-    singular_values = singular_values_2.sqrt().to(dtype=dtype, device=device)
+    singular_values = torch.sqrt(evals.clamp_min(0.0)).to(dtype=dtype, device=device)
     return quaternions, singular_values
 
 
