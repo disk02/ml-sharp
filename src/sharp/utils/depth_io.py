@@ -11,8 +11,8 @@ from pathlib import Path
 import imageio.v2 as iio
 import numpy as np
 
-DEPTH_EXTENSION_PRIORITY = [".npy", ".exr", ".png"]
-SUPPORTED_DEPTH_EXTENSIONS = {".npy", ".png", ".exr"}
+DEPTH_EXTENSION_PRIORITY = [".npy", ".png"]
+SUPPORTED_DEPTH_EXTENSIONS = {".npy", ".png"}
 
 
 def _ensure_hw(depth: np.ndarray) -> np.ndarray:
@@ -40,11 +40,6 @@ def load_depth(path: Path, scale: float) -> np.ndarray:
             raise ValueError(
                 f"Expected uint16 PNG depth for {path}, got {depth.dtype} instead."
             )
-    elif suffix == ".exr":
-        raise ValueError(
-            "EXR depth files are not supported in this build. "
-            "Convert to .npy or uint16 .png."
-        )
     else:
         raise ValueError(
             f"Unsupported depth format {path.suffix}. "
@@ -52,8 +47,9 @@ def load_depth(path: Path, scale: float) -> np.ndarray:
         )
 
     depth = _ensure_hw(depth).astype(np.float32) * scale
-    if not np.isfinite(depth).all():
-        raise ValueError(f"Depth map {path} contains NaN or Inf values.")
+    non_finite = ~np.isfinite(depth)
+    if non_finite.any():
+        depth[non_finite] = 0.0
     return depth
 
 

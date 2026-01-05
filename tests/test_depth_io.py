@@ -18,6 +18,20 @@ def test_load_depth_npy_applies_scale(tmp_path: Path) -> None:
     np.testing.assert_allclose(loaded, data * 0.5)
 
 
+def test_load_depth_sanitizes_non_finite(tmp_path: Path) -> None:
+    data = np.array([[1.0, np.nan], [np.inf, 2.0]], dtype=np.float32)
+    path = tmp_path / "depth.npy"
+    np.save(path, data)
+
+    loaded = load_depth(path, scale=1.0)
+    assert loaded.dtype == np.float32
+    assert loaded.shape == (2, 2)
+    assert loaded[0, 1] == 0.0
+    assert loaded[1, 0] == 0.0
+    assert loaded[0, 0] == 1.0
+    assert loaded[1, 1] == 2.0
+
+
 def test_load_depth_png_uint16(tmp_path: Path) -> None:
     data = np.array([[1000, 2000], [3000, 0]], dtype=np.uint16)
     path = tmp_path / "depth.png"
