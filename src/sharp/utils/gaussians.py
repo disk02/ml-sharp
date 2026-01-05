@@ -153,11 +153,6 @@ def decompose_covariance_matrices(
     covariance_matrices = 0.5 * (
         covariance_matrices + covariance_matrices.transpose(-1, -2)
     )
-    eps = 1e-6
-    covariance_matrices = covariance_matrices + eps * torch.eye(
-        3, device=covariance_matrices.device, dtype=covariance_matrices.dtype
-    )
-
     finite_mask = torch.isfinite(covariance_matrices).all(dim=(-1, -2))
 
     flat_covariances = covariance_matrices.reshape(-1, 3, 3)
@@ -186,16 +181,21 @@ def decompose_covariance_matrices(
 
     cpu_fallbacks = num_invalid
 
+    eye3 = torch.eye(
+        3, device=covariance_matrices.device, dtype=covariance_matrices.dtype
+    )
+
     def _batched_eigh_chunked(
-        indices: torch.Tensor, chunk_size: int
+        indices: torch.Tensor, chunk_size: int, jitter: float | None = None
     ) -> torch.Tensor:
         failed_chunks: list[torch.Tensor] = []
         for i in range(0, indices.numel(), chunk_size):
             chunk = indices[i : i + chunk_size]
             try:
-                evals_chunk, evecs_chunk = torch.linalg.eigh(
-                    flat_covariances[chunk]
-                )
+                cov_chunk = flat_covariances[chunk]
+                if jitter is not None:
+                    cov_chunk = cov_chunk + jitter * eye3
+                evals_chunk, evecs_chunk = torch.linalg.eigh(cov_chunk)
                 flat_evals[chunk] = evals_chunk
                 flat_evecs[chunk] = evecs_chunk
             except RuntimeError:
@@ -225,7 +225,9 @@ def decompose_covariance_matrices(
                 int(failed_indices.numel()),
                 chunk_size,
             )
-            failed_indices = _batched_eigh_chunked(failed_indices, chunk_size)
+            failed_indices = _batched_eigh_chunked(
+                failed_indices, chunk_size, jitter=1e-8
+            )
 
     if num_invalid > 0:
         evals_invalid, evecs_invalid = _cpu_eigh(

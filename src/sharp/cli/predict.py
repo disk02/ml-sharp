@@ -330,8 +330,24 @@ def predict_image(
         opacities=gaussians_ndc.opacities.float(),
     )
     quaternions = gaussians_ndc.quaternions
-    quaternions = quaternions / quaternions.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-    singular_values = gaussians_ndc.singular_values.clamp(min=1e-4, max=1e2)
+    quat_norm = quaternions.norm(dim=-1, keepdim=True)
+    quat_valid = torch.isfinite(quat_norm) & (quat_norm > 1e-8)
+    identity_quat = torch.tensor(
+        [0.0, 0.0, 0.0, 1.0], device=quaternions.device, dtype=quaternions.dtype
+    )
+    quaternions = torch.where(
+        quat_valid, quaternions / quat_norm.clamp_min(1e-8), identity_quat
+    )
+
+    singular_values = gaussians_ndc.singular_values
+    bad_scales = ~torch.isfinite(singular_values) | (singular_values <= 0)
+    if bad_scales.any():
+        LOGGER.warning(
+            "Repairing %d invalid singular value entries.",
+            int(bad_scales.sum().item()),
+        )
+        singular_values = singular_values.clone()
+        singular_values[bad_scales] = 1e-3
     gaussians_ndc = Gaussians3D(
         mean_vectors=gaussians_ndc.mean_vectors,
         singular_values=singular_values,
