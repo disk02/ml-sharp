@@ -114,18 +114,23 @@ def predict_cli(
 
     extensions = io.get_supported_image_extensions()
 
-    image_paths = []
+    image_paths: list[Path] = []
+    input_is_dir = input_path.is_dir()
     if input_path.is_file():
         if input_path.suffix in extensions:
             image_paths = [input_path]
     else:
         for ext in extensions:
-            image_paths.extend(list(input_path.glob(f"**/*{ext}")))
+            image_paths.extend(path for path in input_path.rglob(f"*{ext}") if path.is_file())
 
     if len(image_paths) == 0:
+        if input_is_dir:
+            raise click.ClickException(f"No valid inputs found under {input_path}.")
         LOGGER.info("No valid images found. Input was %s.", input_path)
         return
 
+    LOGGER.info("Input root: %s", input_path)
+    LOGGER.info("Output root: %s", output_path)
     LOGGER.info("Processing %d valid image files.", len(image_paths))
 
     if device == "default":
@@ -165,8 +170,11 @@ def predict_cli(
     else:
         effective_save_ply = bool(save_ply)
 
-    for image_path in image_paths:
-        LOGGER.info("Processing %s", image_path)
+    for index, image_path in enumerate(image_paths, start=1):
+        rel_path = image_path.relative_to(input_path) if input_is_dir else Path(image_path.name)
+        out_dir = output_path / rel_path.parent if input_is_dir else output_path
+        out_dir.mkdir(parents=True, exist_ok=True)
+        LOGGER.info("Processing %s (%d/%d)", image_path, index, len(image_paths))
         image, _, f_px = io.load_rgb(image_path)
         height, width = image.shape[:2]
         intrinsics = torch.tensor(
@@ -183,7 +191,7 @@ def predict_cli(
 
         if effective_save_ply:
             LOGGER.info("Saving 3DGS to %s", output_path)
-            save_ply(gaussians, f_px, (height, width), output_path / f"{image_path.stem}.ply")
+            save_ply(gaussians, f_px, (height, width), out_dir / f"{image_path.stem}.ply")
         else:
             if save_ply is None and want_sbs_image:
                 LOGGER.info(
@@ -198,27 +206,34 @@ def predict_cli(
             sbs_out = Path(sbs_image)
             # Support `--sbs-image` with no value: default to output directory
             if sbs_out.name == "__AUTO__":
-                sbs_image_path = output_path / f"{image_path.stem}_sbs.png"
+                sbs_image_path = out_dir / f"{image_path.stem}_sbs.png"
             else:
                 # If a directory path is provided (no suffix), place an image per input
                 if sbs_out.suffix == "":
-                    sbs_image_path = sbs_out / f"{image_path.stem}_sbs.png"
+                    sbs_base = sbs_out
+                    if input_is_dir:
+                        sbs_base = sbs_out / rel_path.parent
+                        sbs_base.mkdir(parents=True, exist_ok=True)
+                    sbs_image_path = sbs_base / f"{image_path.stem}_sbs.png"
                 else:
                     # If multiple inputs are processed and a single file path is given, avoid overwrites
                     if len(image_paths) > 1:
+                        rel_stem = "_".join(rel_path.with_suffix("").parts)
                         sbs_image_path = sbs_out.with_name(
-                            f"{sbs_out.stem}_{image_path.stem}{sbs_out.suffix}"
+                            f"{sbs_out.stem}_{rel_stem}{sbs_out.suffix}"
                         )
                     else:
                         sbs_image_path = sbs_out
+            if sbs_image_path is not None:
+                sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
 
         if want_video or sbs_image_path is not None:
             if want_video:
-                output_video_path = (output_path / image_path.stem).with_suffix(".mp4")
+                output_video_path = (out_dir / image_path.stem).with_suffix(".mp4")
                 LOGGER.info("Rendering trajectory to %s", output_video_path)
             else:
                 # Placeholder path; render_gaussians will not write video when sbs_image_path is set.
-                output_video_path = (output_path / image_path.stem).with_suffix(".mp4")
+                output_video_path = (out_dir / image_path.stem).with_suffix(".mp4")
 
             metadata = SceneMetaData(intrinsics[0, 0].item(), (width, height), "linearRGB")
 
