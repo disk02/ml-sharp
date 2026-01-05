@@ -148,24 +148,31 @@ def decompose_covariance_matrices(
     device = covariance_matrices.device
     dtype = covariance_matrices.dtype
 
-    # We convert to fp64 to avoid numerical errors.
-    covariance_matrices = covariance_matrices.detach().cpu().to(torch.float64)
-    rotations, singular_values_2, _ = torch.linalg.svd(covariance_matrices)
+    # Use symmetric eigendecomposition on-device to avoid CPU round-trips.
+    covariance_matrices = covariance_matrices.detach().to(torch.float32)
+    evals, evecs = torch.linalg.eigh(covariance_matrices)
 
-    # NOTE: in SVD, it is possible that U and VT are both reflections.
-    # We need to correct them.
-    batch_idx, gaussian_idx = torch.where(torch.linalg.det(rotations) < 0)
-    num_reflections = len(gaussian_idx)
+    # Sort eigenvalues descending (largest scale first) and reorder eigenvectors (columns).
+    sort_idx = evals.argsort(dim=-1, descending=True)
+    evals = evals.gather(-1, sort_idx)
+    evecs = evecs.gather(
+        -1, sort_idx.unsqueeze(-2).expand(*sort_idx.shape[:-1], 3, 3)
+    )
+
+    # NOTE: it is possible that eigenvectors form a reflection. Correct to rotation.
+    det = torch.linalg.det(evecs)
+    num_reflections = int((det < 0).sum().item())
     if num_reflections > 0:
         LOGGER.warning(
-            "Received %d reflection matrices from SVD. Flipping them to rotations.",
+            "Received %d reflection matrices from EIGH. Flipping them to rotations.",
             num_reflections,
         )
-        # Flip the last column of reflection and make it a rotation.
-        rotations[batch_idx, gaussian_idx, :, -1] *= -1
-    quaternions = linalg.quaternions_from_rotation_matrices(rotations)
+        evecs = evecs.clone()
+        evecs[det < 0, :, -1] *= -1
+
+    quaternions = linalg.quaternions_from_rotation_matrices(evecs)
     quaternions = quaternions.to(dtype=dtype, device=device)
-    singular_values = singular_values_2.sqrt().to(dtype=dtype, device=device)
+    singular_values = torch.sqrt(evals.clamp_min(0.0)).to(dtype=dtype, device=device)
     return quaternions, singular_values
 
 
