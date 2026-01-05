@@ -96,8 +96,8 @@ def test_depth_override_used():
     expected = torch.where(torch.isfinite(expected), expected, expected.new_tensor(0.0))
     expected = F.interpolate(expected, size=(2, 2), mode="nearest")
     invalid_mask = (~torch.isfinite(expected)) | (expected <= 0)
-    expected = expected.clamp(min=1e-4, max=1e4)
     expected = torch.where(invalid_mask, expected.new_tensor(1e-4), expected)
+    expected = expected.clamp(min=1e-4, max=1e4)
 
     torch.testing.assert_close(init_model.last_depth, expected)
 

@@ -129,9 +129,10 @@ class RGBGaussianPredictor(nn.Module):
         Note:
         ----
         During training, it is recommended to feed an additional ground truth depth
-        map to the network to align the predicted depth to. During inference, it is
-        recommended to use depth_gt=None and use monodepth_disparity output from the
-        model instead to compute depth.
+        map to the network to align the predicted depth to. During inference, you may
+        either omit depth and use monodepth disparity as before, or provide
+        depth_override (metric depth or disparity with depth_override_is_disparity=True)
+        to drive geometry initialization.
         """
         # Estimate depth and align to ground truth (if available).
         monodepth_output = self.monodepth_model(image)
@@ -191,6 +192,11 @@ class RGBGaussianPredictor(nn.Module):
             if depth_used.dim() != 4 or depth_used.shape[1] != 1:
                 raise ValueError(
                     "depth_override must have shape [B, 1, H, W] or [B, H, W]."
+                )
+            if depth_used.shape[0] != image.shape[0]:
+                raise ValueError(
+                    "depth_override batch size must match image batch size: "
+                    f"{depth_used.shape[0]} != {image.shape[0]}"
                 )
 
             depth_used = depth_used.to(device=image.device)
