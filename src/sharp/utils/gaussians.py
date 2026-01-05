@@ -150,6 +150,14 @@ def decompose_covariance_matrices(
 
     # Use symmetric eigendecomposition on-device to avoid CPU round-trips.
     covariance_matrices = covariance_matrices.detach().to(torch.float32)
+    covariance_matrices = 0.5 * (
+        covariance_matrices + covariance_matrices.transpose(-1, -2)
+    )
+    eps = 1e-6
+    covariance_matrices = covariance_matrices + eps * torch.eye(
+        3, device=covariance_matrices.device, dtype=covariance_matrices.dtype
+    )
+
     finite_mask = torch.isfinite(covariance_matrices).all(dim=(-1, -2))
 
     flat_covariances = covariance_matrices.reshape(-1, 3, 3)
@@ -176,45 +184,41 @@ def decompose_covariance_matrices(
         rotations, singular_values_2, _ = torch.linalg.svd(covariances)
         return rotations, singular_values_2
 
-    if flat_mask.any():
+    per_matrix_failures = 0
+    cpu_fallbacks = num_invalid
+
+    valid_indices = flat_mask.nonzero(as_tuple=False).flatten()
+    if valid_indices.numel() > 0:
         try:
             evals_valid, evecs_valid = torch.linalg.eigh(flat_covariances[flat_mask])
+            flat_evals[flat_mask] = evals_valid
+            flat_evecs[flat_mask] = evecs_valid
         except RuntimeError as exc:
             LOGGER.warning(
-                "EIGH failed on device; falling back to CPU SVD. Error: %s",
+                "Batched EIGH failed on device; retrying per-matrix. Error: %s",
                 exc,
             )
-            rotations, singular_values_2 = _cpu_svd(
-                flat_covariances.cpu().to(torch.float64)
-            )
-            evals = singular_values_2.to(device=device, dtype=covariance_matrices.dtype)
-            evecs = rotations.to(device=device, dtype=covariance_matrices.dtype)
-            evals = evals.reshape(*covariance_matrices.shape[:-1])
-            evecs = evecs.reshape(*covariance_matrices.shape)
-            sort_idx = evals.argsort(dim=-1, descending=True)
-            evals = evals.gather(-1, sort_idx)
-            evecs = evecs.gather(
-                -1, sort_idx.unsqueeze(-2).expand(*sort_idx.shape[:-1], 3, 3)
-            )
-            det = torch.linalg.det(evecs)
-            num_reflections = int((det < 0).sum().item())
-            if num_reflections > 0:
-                LOGGER.warning(
-                    "Received %d reflection matrices from SVD. Flipping them to rotations.",
-                    num_reflections,
+            failed_indices: list[int] = []
+            for idx in valid_indices.tolist():
+                try:
+                    evals_single, evecs_single = torch.linalg.eigh(flat_covariances[idx])
+                    flat_evals[idx] = evals_single
+                    flat_evecs[idx] = evecs_single
+                except RuntimeError:
+                    failed_indices.append(idx)
+
+            per_matrix_failures = len(failed_indices)
+            if failed_indices:
+                cpu_fallbacks += per_matrix_failures
+                rotations_failed, singular_values_failed = _cpu_svd(
+                    flat_covariances[failed_indices].cpu().to(torch.float64)
                 )
-                evecs = evecs.clone()
-                evecs[..., :, -1] *= torch.where(
-                    (det < 0)[..., None], -1.0, 1.0
-                ).to(evecs.dtype)
-            quaternions = linalg.quaternions_from_rotation_matrices(evecs)
-            quaternions = quaternions.to(dtype=dtype, device=device)
-            singular_values = torch.sqrt(evals.clamp_min(0.0)).to(
-                dtype=dtype, device=device
-            )
-            return quaternions, singular_values
-        flat_evals[flat_mask] = evals_valid
-        flat_evecs[flat_mask] = evecs_valid
+                flat_evals[failed_indices] = singular_values_failed.to(
+                    device=device, dtype=covariance_matrices.dtype
+                )
+                flat_evecs[failed_indices] = rotations_failed.to(
+                    device=device, dtype=covariance_matrices.dtype
+                )
 
     if num_invalid > 0:
         rotations_invalid, singular_values_invalid = _cpu_svd(
@@ -225,6 +229,13 @@ def decompose_covariance_matrices(
         )
         flat_evecs[~flat_mask] = rotations_invalid.to(
             device=device, dtype=covariance_matrices.dtype
+        )
+
+    if per_matrix_failures > 0 or num_invalid > 0:
+        LOGGER.warning(
+            "Covariance decomposition fallbacks: per-matrix failures=%d cpu_fallbacks=%d",
+            per_matrix_failures,
+            cpu_fallbacks,
         )
 
     evals = flat_evals.reshape(*covariance_matrices.shape[:-1])

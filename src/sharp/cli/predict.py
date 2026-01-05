@@ -329,6 +329,16 @@ def predict_image(
         colors=gaussians_ndc.colors.float(),
         opacities=gaussians_ndc.opacities.float(),
     )
+    quaternions = gaussians_ndc.quaternions
+    quaternions = quaternions / quaternions.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+    singular_values = gaussians_ndc.singular_values.clamp(min=1e-4, max=1e2)
+    gaussians_ndc = Gaussians3D(
+        mean_vectors=gaussians_ndc.mean_vectors,
+        singular_values=singular_values,
+        quaternions=quaternions,
+        colors=gaussians_ndc.colors,
+        opacities=gaussians_ndc.opacities,
+    )
     intrinsics = (
         torch.tensor(
             [
