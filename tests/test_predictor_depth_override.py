@@ -288,3 +288,64 @@ def test_depth_override_calibration_skips_when_insufficient_valid():
 
     expected = torch.full((1, 1, 2, 2), 0.5)
     torch.testing.assert_close(init_model.last_depth, expected)
+
+
+def test_depth_override_calibration_multi_channel_disparity():
+    image = torch.zeros(1, 3, 4, 4)
+    disparity = torch.stack(
+        [torch.ones(1, 8, 8), torch.full((1, 8, 8), 2.0)], dim=1
+    )
+    init_model = DummyInitModel()
+    predictor = RGBGaussianPredictor(
+        init_model=init_model,
+        monodepth_model=DummyMonodepth(disparity),
+        feature_model=DummyFeatureModel(),
+        prediction_head=DummyPredictionHead(),
+        gaussian_composer=DummyGaussianComposer(),
+        scale_map_estimator=DummyScaleMapEstimator(scale=2.0),
+    )
+
+    depth_override = torch.tensor(
+        [[[0.1, 0.5, 1.0, 0.25], [0.75, 0.2, 0.9, 0.3]]]
+    )
+    disparity_factor = torch.tensor([4.0])
+    predictor(
+        image=image,
+        disparity_factor=disparity_factor,
+        depth_override=depth_override,
+        depth_override_calibration="per_image",
+        depth_override_calibration_percentiles=(0.0, 100.0),
+    )
+
+    assert init_model.last_depth is not None
+    assert init_model.last_depth.shape == (1, 1, 8, 8)
+    assert torch.isfinite(init_model.last_depth).all()
+
+
+def test_depth_override_fallback_multi_channel_disparity():
+    image = torch.zeros(1, 3, 4, 4)
+    disparity = torch.stack(
+        [torch.ones(1, 2, 2), torch.full((1, 2, 2), 2.0)], dim=1
+    )
+    init_model = DummyInitModel()
+    predictor = RGBGaussianPredictor(
+        init_model=init_model,
+        monodepth_model=DummyMonodepth(disparity),
+        feature_model=DummyFeatureModel(),
+        prediction_head=DummyPredictionHead(),
+        gaussian_composer=DummyGaussianComposer(),
+        scale_map_estimator=DummyScaleMapEstimator(scale=2.0),
+    )
+
+    depth_override = torch.tensor([[[0.0, 0.0], [1.0, -1.0]]])
+    disparity_factor = torch.tensor([4.0])
+    predictor(
+        image=image,
+        disparity_factor=disparity_factor,
+        depth_override=depth_override,
+        depth_override_fill_mode="monodepth_fallback",
+    )
+
+    assert init_model.last_depth is not None
+    assert init_model.last_depth.shape == (1, 1, 2, 2)
+    assert torch.isfinite(init_model.last_depth).all()

@@ -192,6 +192,13 @@ class RGBGaussianPredictor(nn.Module):
         # logic can be excluded during the tracing and the graph of the predictors is
         # static.
         if depth_override is not None:
+            monodepth_disp_ref = monodepth_disparity
+            if monodepth_disp_ref.dim() == 4 and monodepth_disp_ref.shape[1] != 1:
+                LOGGER.debug(
+                    "Reducing monodepth disparity channels from %s to 1 for override.",
+                    monodepth_disp_ref.shape[1],
+                )
+                monodepth_disp_ref = monodepth_disp_ref[:, :1]
             depth_used = depth_override
             if depth_used.dim() == 3:
                 depth_used = depth_used.unsqueeze(1)
@@ -222,7 +229,7 @@ class RGBGaussianPredictor(nn.Module):
                 depth_used = disparity_factor_f / depth_used.clamp(min=1e-4, max=1e4)
 
             if depth_override_calibration != "none":
-                monodepth_f = disparity_factor_f / monodepth_disparity.float().clamp(
+                monodepth_f = disparity_factor_f / monodepth_disp_ref.float().clamp(
                     min=1e-4, max=1e4
                 )
                 p_lo, p_hi = depth_override_calibration_percentiles
@@ -245,15 +252,15 @@ class RGBGaussianPredictor(nn.Module):
                         depth_used = torch.where(override_valid, a * depth_used + b, depth_used)
                 else:
                     for batch_idx in range(depth_used.shape[0]):
-                        override_valid = torch.isfinite(depth_used[batch_idx]) & (
-                            depth_used[batch_idx] > depth_override_calibration_min_valid
+                        depth_used_i = depth_used[batch_idx, 0]
+                        monodepth_i = monodepth_f[batch_idx, 0]
+                        override_valid = torch.isfinite(depth_used_i) & (
+                            depth_used_i > depth_override_calibration_min_valid
                         )
-                        ref_valid = torch.isfinite(monodepth_f[batch_idx]) & (
-                            monodepth_f[batch_idx] > 0
-                        )
+                        ref_valid = torch.isfinite(monodepth_i) & (monodepth_i > 0)
                         joint_valid = override_valid & ref_valid
-                        override_vals = depth_used[batch_idx][joint_valid]
-                        ref_vals = monodepth_f[batch_idx][joint_valid]
+                        override_vals = depth_used_i[joint_valid]
+                        ref_vals = monodepth_i[joint_valid]
                         if override_vals.numel() < 32 or ref_vals.numel() < 32:
                             continue
                         o_lo = torch.quantile(override_vals, p_lo / 100.0)
@@ -263,14 +270,15 @@ class RGBGaussianPredictor(nn.Module):
                         denom = torch.clamp(o_hi - o_lo, min=1e-6)
                         a = (r_hi - r_lo) / denom
                         b = r_lo - a * o_lo
-                        depth_used[batch_idx] = torch.where(
-                            override_valid, a * depth_used[batch_idx] + b, depth_used[batch_idx]
+                        depth_used_i = torch.where(
+                            override_valid, a * depth_used_i + b, depth_used_i
                         )
+                        depth_used[batch_idx, 0] = depth_used_i
 
             invalid_mask = (~torch.isfinite(depth_used)) | (depth_used <= 0)
             if depth_override_fill_mode == "monodepth_fallback":
                 if depth_override_calibration == "none":
-                    monodepth_f = disparity_factor_f / monodepth_disparity.float().clamp(
+                    monodepth_f = disparity_factor_f / monodepth_disp_ref.float().clamp(
                         min=1e-4, max=1e4
                     )
                 depth_used = torch.where(invalid_mask, monodepth_f, depth_used)
