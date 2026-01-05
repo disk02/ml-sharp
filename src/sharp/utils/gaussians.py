@@ -184,41 +184,48 @@ def decompose_covariance_matrices(
         rotations, singular_values_2, _ = torch.linalg.svd(covariances)
         return rotations, singular_values_2
 
-    per_matrix_failures = 0
     cpu_fallbacks = num_invalid
 
-    valid_indices = flat_mask.nonzero(as_tuple=False).flatten()
-    if valid_indices.numel() > 0:
-        try:
-            evals_valid, evecs_valid = torch.linalg.eigh(flat_covariances[flat_mask])
-            flat_evals[flat_mask] = evals_valid
-            flat_evecs[flat_mask] = evecs_valid
-        except RuntimeError as exc:
-            LOGGER.warning(
-                "Batched EIGH failed on device; retrying per-matrix. Error: %s",
-                exc,
+    def _batched_eigh_chunked(
+        indices: torch.Tensor, chunk_size: int
+    ) -> torch.Tensor:
+        failed_chunks: list[torch.Tensor] = []
+        for i in range(0, indices.numel(), chunk_size):
+            chunk = indices[i : i + chunk_size]
+            try:
+                evals_chunk, evecs_chunk = torch.linalg.eigh(
+                    flat_covariances[chunk]
+                )
+                flat_evals[chunk] = evals_chunk
+                flat_evecs[chunk] = evecs_chunk
+            except RuntimeError:
+                failed_chunks.append(chunk)
+        if not failed_chunks:
+            return torch.empty(
+                (0,), device=indices.device, dtype=indices.dtype
             )
-            failed_indices: list[int] = []
-            for idx in valid_indices.tolist():
-                try:
-                    evals_single, evecs_single = torch.linalg.eigh(flat_covariances[idx])
-                    flat_evals[idx] = evals_single
-                    flat_evecs[idx] = evecs_single
-                except RuntimeError:
-                    failed_indices.append(idx)
+        return torch.cat(failed_chunks, dim=0)
 
-            per_matrix_failures = len(failed_indices)
-            if failed_indices:
-                cpu_fallbacks += per_matrix_failures
-                rotations_failed, singular_values_failed = _cpu_svd(
-                    flat_covariances[failed_indices].cpu().to(torch.float64)
-                )
-                flat_evals[failed_indices] = singular_values_failed.to(
-                    device=device, dtype=covariance_matrices.dtype
-                )
-                flat_evecs[failed_indices] = rotations_failed.to(
-                    device=device, dtype=covariance_matrices.dtype
-                )
+    valid_indices = flat_mask.nonzero(as_tuple=False).flatten()
+    failed_indices = torch.empty(
+        (0,), device=valid_indices.device, dtype=valid_indices.dtype
+    )
+    if valid_indices.numel() > 0:
+        chunk_size = 1024
+        LOGGER.warning(
+            "Attempting batched EIGH on %d matrices with chunk_size=%d.",
+            int(valid_indices.numel()),
+            chunk_size,
+        )
+        failed_indices = _batched_eigh_chunked(valid_indices, chunk_size)
+        if failed_indices.numel() > 0:
+            chunk_size = max(16, chunk_size // 4)
+            LOGGER.warning(
+                "Retrying batched EIGH on %d matrices with chunk_size=%d.",
+                int(failed_indices.numel()),
+                chunk_size,
+            )
+            failed_indices = _batched_eigh_chunked(failed_indices, chunk_size)
 
     if num_invalid > 0:
         rotations_invalid, singular_values_invalid = _cpu_svd(
@@ -231,10 +238,22 @@ def decompose_covariance_matrices(
             device=device, dtype=covariance_matrices.dtype
         )
 
-    if per_matrix_failures > 0 or num_invalid > 0:
+    if failed_indices.numel() > 0:
+        cpu_fallbacks += int(failed_indices.numel())
+        rotations_failed, singular_values_failed = _cpu_svd(
+            flat_covariances[failed_indices].cpu().to(torch.float64)
+        )
+        flat_evals[failed_indices] = singular_values_failed.to(
+            device=device, dtype=covariance_matrices.dtype
+        )
+        flat_evecs[failed_indices] = rotations_failed.to(
+            device=device, dtype=covariance_matrices.dtype
+        )
+
+    if failed_indices.numel() > 0 or num_invalid > 0:
         LOGGER.warning(
-            "Covariance decomposition fallbacks: per-matrix failures=%d cpu_fallbacks=%d",
-            per_matrix_failures,
+            "Covariance decomposition fallbacks: failed_indices=%d cpu_fallbacks=%d",
+            int(failed_indices.numel()),
             cpu_fallbacks,
         )
 
