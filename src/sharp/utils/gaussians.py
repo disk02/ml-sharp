@@ -150,7 +150,85 @@ def decompose_covariance_matrices(
 
     # Use symmetric eigendecomposition on-device to avoid CPU round-trips.
     covariance_matrices = covariance_matrices.detach().to(torch.float32)
-    evals, evecs = torch.linalg.eigh(covariance_matrices)
+    finite_mask = torch.isfinite(covariance_matrices).all(dim=(-1, -2))
+
+    flat_covariances = covariance_matrices.reshape(-1, 3, 3)
+    flat_mask = finite_mask.reshape(-1)
+    flat_evals = torch.empty(
+        (flat_covariances.shape[0], 3),
+        device=covariance_matrices.device,
+        dtype=covariance_matrices.dtype,
+    )
+    flat_evecs = torch.empty(
+        (flat_covariances.shape[0], 3, 3),
+        device=covariance_matrices.device,
+        dtype=covariance_matrices.dtype,
+    )
+
+    num_invalid = int((~flat_mask).sum().item())
+    if num_invalid > 0:
+        LOGGER.warning(
+            "Received %d non-finite covariance matrices. Falling back to CPU for them.",
+            num_invalid,
+        )
+
+    def _cpu_svd(covariances: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        rotations, singular_values_2, _ = torch.linalg.svd(covariances)
+        return rotations, singular_values_2
+
+    if flat_mask.any():
+        try:
+            evals_valid, evecs_valid = torch.linalg.eigh(flat_covariances[flat_mask])
+        except RuntimeError as exc:
+            LOGGER.warning(
+                "EIGH failed on device; falling back to CPU SVD. Error: %s",
+                exc,
+            )
+            rotations, singular_values_2 = _cpu_svd(
+                flat_covariances.cpu().to(torch.float64)
+            )
+            evals = singular_values_2.to(device=device, dtype=covariance_matrices.dtype)
+            evecs = rotations.to(device=device, dtype=covariance_matrices.dtype)
+            evals = evals.reshape(*covariance_matrices.shape[:-1])
+            evecs = evecs.reshape(*covariance_matrices.shape)
+            sort_idx = evals.argsort(dim=-1, descending=True)
+            evals = evals.gather(-1, sort_idx)
+            evecs = evecs.gather(
+                -1, sort_idx.unsqueeze(-2).expand(*sort_idx.shape[:-1], 3, 3)
+            )
+            det = torch.linalg.det(evecs)
+            num_reflections = int((det < 0).sum().item())
+            if num_reflections > 0:
+                LOGGER.warning(
+                    "Received %d reflection matrices from SVD. Flipping them to rotations.",
+                    num_reflections,
+                )
+                evecs = evecs.clone()
+                evecs[..., :, -1] *= torch.where(
+                    (det < 0)[..., None], -1.0, 1.0
+                ).to(evecs.dtype)
+            quaternions = linalg.quaternions_from_rotation_matrices(evecs)
+            quaternions = quaternions.to(dtype=dtype, device=device)
+            singular_values = torch.sqrt(evals.clamp_min(0.0)).to(
+                dtype=dtype, device=device
+            )
+            return quaternions, singular_values
+        flat_evals[flat_mask] = evals_valid
+        flat_evecs[flat_mask] = evecs_valid
+
+    if num_invalid > 0:
+        rotations_invalid, singular_values_invalid = _cpu_svd(
+            flat_covariances[~flat_mask].cpu().to(torch.float64)
+        )
+        flat_evals[~flat_mask] = singular_values_invalid.to(
+            device=device, dtype=covariance_matrices.dtype
+        )
+        flat_evecs[~flat_mask] = rotations_invalid.to(
+            device=device, dtype=covariance_matrices.dtype
+        )
+
+    evals = flat_evals.reshape(*covariance_matrices.shape[:-1])
+    evecs = flat_evecs.reshape(*covariance_matrices.shape)
 
     # Sort eigenvalues descending (largest scale first) and reorder eigenvectors (columns).
     sort_idx = evals.argsort(dim=-1, descending=True)
@@ -168,7 +246,9 @@ def decompose_covariance_matrices(
             num_reflections,
         )
         evecs = evecs.clone()
-        evecs[det < 0, :, -1] *= -1
+        evecs[..., :, -1] *= torch.where((det < 0)[..., None], -1.0, 1.0).to(
+            evecs.dtype
+        )
 
     quaternions = linalg.quaternions_from_rotation_matrices(evecs)
     quaternions = quaternions.to(dtype=dtype, device=device)
