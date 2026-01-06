@@ -7,6 +7,7 @@ Copyright (C) 2025 Apple Inc. All Rights Reserved.
 from __future__ import annotations
 
 import logging
+from time import perf_counter
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
@@ -16,6 +17,7 @@ from plyfile import PlyData, PlyElement
 
 from sharp.utils import color_space as cs_utils
 from sharp.utils import linalg
+from sharp.utils.metrics import Metrics
 
 LOGGER = logging.getLogger(__name__)
 
@@ -91,14 +93,20 @@ def unproject_gaussians(
     extrinsics: torch.Tensor,
     intrinsics: torch.Tensor,
     image_shape: tuple[int, int],
+    metrics: Metrics | None = None,
 ) -> Gaussians3D:
     """Unproject Gaussians from NDC space to world coordinates."""
+    start_time = perf_counter() if metrics else None
     unprojection_matrix = get_unprojection_matrix(extrinsics, intrinsics, image_shape)
-    gaussians = apply_transform(gaussians_ndc, unprojection_matrix[:3])
+    gaussians = apply_transform(gaussians_ndc, unprojection_matrix[:3], metrics=metrics)
+    if metrics and start_time is not None:
+        metrics.add_time("unproject_total", perf_counter() - start_time)
     return gaussians
 
 
-def apply_transform(gaussians: Gaussians3D, transform: torch.Tensor) -> Gaussians3D:
+def apply_transform(
+    gaussians: Gaussians3D, transform: torch.Tensor, metrics: Metrics | None = None
+) -> Gaussians3D:
     """Apply an affine transformation to 3D Gaussians.
 
     Args:
@@ -110,6 +118,7 @@ def apply_transform(gaussians: Gaussians3D, transform: torch.Tensor) -> Gaussian
 
     Note: This operation is not differentiable.
     """
+    start_time = perf_counter() if metrics else None
     transform_linear = transform[..., :3, :3]
     transform_offset = transform[..., :3, 3]
 
@@ -120,7 +129,11 @@ def apply_transform(gaussians: Gaussians3D, transform: torch.Tensor) -> Gaussian
     covariance_matrices = (
         transform_linear @ covariance_matrices @ transform_linear.transpose(-1, -2)
     )
-    quaternions, singular_values = decompose_covariance_matrices(covariance_matrices)
+    quaternions, singular_values = decompose_covariance_matrices(
+        covariance_matrices, metrics=metrics
+    )
+    if metrics and start_time is not None:
+        metrics.add_time("apply_transform", perf_counter() - start_time)
 
     return Gaussians3D(
         mean_vectors=mean_vectors,
@@ -133,6 +146,7 @@ def apply_transform(gaussians: Gaussians3D, transform: torch.Tensor) -> Gaussian
 
 def decompose_covariance_matrices(
     covariance_matrices: torch.Tensor,
+    metrics: Metrics | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Decompose 3D covariance matrices into quaternions and singular values.
 
@@ -145,6 +159,7 @@ def decompose_covariance_matrices(
 
     Note: This operation is not differentiable.
     """
+    start_time = perf_counter() if metrics else None
     device = covariance_matrices.device
     dtype = covariance_matrices.dtype
 
@@ -174,6 +189,8 @@ def decompose_covariance_matrices(
             "Received %d non-finite covariance matrices. Falling back to CPU for them.",
             num_invalid,
         )
+        if metrics:
+            metrics.inc("cov_nonfinite", num_invalid)
 
     def _cpu_eigh(covariances: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         evals, evecs = torch.linalg.eigh(covariances)
@@ -187,7 +204,7 @@ def decompose_covariance_matrices(
 
     def _batched_eigh_chunked(
         indices: torch.Tensor, chunk_size: int, jitter: float | None = None
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, int]:
         failed_chunks: list[torch.Tensor] = []
         for i in range(0, indices.numel(), chunk_size):
             chunk = indices[i : i + chunk_size]
@@ -201,10 +218,11 @@ def decompose_covariance_matrices(
             except RuntimeError:
                 failed_chunks.append(chunk)
         if not failed_chunks:
-            return torch.empty(
-                (0,), device=indices.device, dtype=indices.dtype
+            return (
+                torch.empty((0,), device=indices.device, dtype=indices.dtype),
+                0,
             )
-        return torch.cat(failed_chunks, dim=0)
+        return torch.cat(failed_chunks, dim=0), len(failed_chunks)
 
     valid_indices = flat_mask.nonzero(as_tuple=False).flatten()
     failed_indices = torch.empty(
@@ -217,15 +235,17 @@ def decompose_covariance_matrices(
             int(valid_indices.numel()),
             chunk_size,
         )
-        failed_indices = _batched_eigh_chunked(valid_indices, chunk_size)
+        failed_indices, failed_chunks = _batched_eigh_chunked(valid_indices, chunk_size)
         if failed_indices.numel() > 0:
+            if metrics:
+                metrics.inc("eigh_retry_chunks", failed_chunks)
             chunk_size = max(16, chunk_size // 4)
             LOGGER.warning(
                 "Retrying batched EIGH on %d matrices with chunk_size=%d.",
                 int(failed_indices.numel()),
                 chunk_size,
             )
-            failed_indices = _batched_eigh_chunked(
+            failed_indices, _ = _batched_eigh_chunked(
                 failed_indices, chunk_size, jitter=1e-8
             )
 
@@ -258,6 +278,8 @@ def decompose_covariance_matrices(
             int(failed_indices.numel()),
             cpu_fallbacks,
         )
+    if metrics and cpu_fallbacks > 0:
+        metrics.inc("eigh_cpu_fallback", cpu_fallbacks)
 
     evals = flat_evals.reshape(*covariance_matrices.shape[:-1])
     evecs = flat_evecs.reshape(*covariance_matrices.shape)
@@ -277,6 +299,8 @@ def decompose_covariance_matrices(
             "Received %d reflection matrices from EIGH. Flipping them to rotations.",
             num_reflections,
         )
+        if metrics:
+            metrics.inc("ortho_warn", num_reflections)
         evecs = evecs.clone()
         evecs[..., :, -1] *= torch.where((det < 0)[..., None], -1.0, 1.0).to(
             evecs.dtype
@@ -285,6 +309,8 @@ def decompose_covariance_matrices(
     quaternions = linalg.quaternions_from_rotation_matrices(evecs)
     quaternions = quaternions.to(dtype=dtype, device=device)
     singular_values = torch.sqrt(evals.clamp_min(0.0)).to(dtype=dtype, device=device)
+    if metrics and start_time is not None:
+        metrics.add_time("decompose_covariance", perf_counter() - start_time)
     return quaternions, singular_values
 
 
@@ -464,9 +490,14 @@ def load_ply(path: Path) -> tuple[Gaussians3D, SceneMetaData]:
 
 @torch.no_grad()
 def save_ply(
-    gaussians: Gaussians3D, f_px: float, image_shape: tuple[int, int], path: Path
+    gaussians: Gaussians3D,
+    f_px: float,
+    image_shape: tuple[int, int],
+    path: Path,
+    metrics: Metrics | None = None,
 ) -> PlyData:
     """Save a predicted Gaussian3D to a ply file."""
+    start_time = perf_counter() if metrics else None
 
     def _inverse_sigmoid(tensor: torch.Tensor) -> torch.Tensor:
         return torch.log(tensor / (1.0 - tensor))
@@ -599,4 +630,6 @@ def save_ply(
     )
 
     plydata.write(path)
+    if metrics and start_time is not None:
+        metrics.add_time("save_ply", perf_counter() - start_time)
     return plydata

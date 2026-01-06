@@ -10,6 +10,7 @@ from PIL import Image
 
 from sharp.utils import camera, gsplat, io
 from sharp.utils.gaussians import Gaussians3D, SceneMetaData
+from sharp.utils.metrics import Metrics
 
 
 def render_gaussians(
@@ -19,8 +20,11 @@ def render_gaussians(
     params: camera.TrajectoryParams | None = None,
     sbs_image_path: Path | None = None,
     sbs_image_frame: int = 0,
+    metrics: Metrics | None = None,
 ) -> None:
     """Render a single gaussian checkpoint file."""
+    if metrics:
+        metrics.inc("render_calls")
     (width, height) = metadata.resolution_px
     f_px = metadata.focal_length_px
 
@@ -65,6 +69,8 @@ def render_gaussians(
     video_writer = io.VideoWriter(output_path) if sbs_image_path is None else None
 
     for frame_idx, eye_mid in enumerate(trajectory):
+        if metrics:
+            metrics.inc("render_frames")
         # Treat the trajectory as the *midpoint* between eyes so the midpoint stays centered.
         eye_position_l = eye_mid.clone()
         eye_position_l[0] -= baseline * 0.5

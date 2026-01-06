@@ -7,6 +7,7 @@ Copyright (C) 2025 Apple Inc. All Rights Reserved.
 from __future__ import annotations
 
 import logging
+from time import perf_counter
 from pathlib import Path
 
 import click
@@ -28,6 +29,7 @@ from sharp.utils.gaussians import (
     save_ply,
     unproject_gaussians,
 )
+from sharp.utils.metrics import Metrics
 
 from sharp.rendering.gaussian_renderer import render_gaussians
 
@@ -196,6 +198,7 @@ def predict_cli(
     gaussian_predictor.to(device)
 
     output_path.mkdir(exist_ok=True, parents=True)
+    metrics = Metrics()
 
     want_sbs_image = sbs_image is not None
     want_video = with_rendering
@@ -206,12 +209,16 @@ def predict_cli(
     else:
         effective_save_ply = bool(save_ply)
 
+    run_start = perf_counter()
     for index, image_path in enumerate(image_paths, start=1):
+        image_start = perf_counter()
         rel_path = image_path.relative_to(input_path) if input_is_dir else Path(image_path.name)
         out_dir = output_path / rel_path.parent if input_is_dir else output_path
         out_dir.mkdir(parents=True, exist_ok=True)
         LOGGER.info("Processing %s (%d/%d)", image_path, index, len(image_paths))
+        io_start = perf_counter()
         image, _, f_px = io.load_rgb(image_path)
+        metrics.add_time("io_decode", perf_counter() - io_start)
         height, width = image.shape[:2]
         intrinsics = torch.tensor(
             [
@@ -223,6 +230,7 @@ def predict_cli(
             device=device,
             dtype=torch.float32,
         )
+        predict_start = perf_counter()
         gaussians = predict_image(
             gaussian_predictor,
             image,
@@ -230,11 +238,19 @@ def predict_cli(
             torch.device(device),
             amp_enabled=amp,
             amp_dtype=amp_autocast_dtype,
+            metrics=metrics,
         )
+        metrics.add_time("predict_total", perf_counter() - predict_start)
 
         if effective_save_ply:
             LOGGER.info("Saving 3DGS to %s", output_path)
-            save_ply(gaussians, f_px, (height, width), out_dir / f"{image_path.stem}.ply")
+            save_ply(
+                gaussians,
+                f_px,
+                (height, width),
+                out_dir / f"{image_path.stem}.ply",
+                metrics=metrics,
+            )
         else:
             if save_ply is None and want_sbs_image:
                 LOGGER.info(
@@ -280,13 +296,19 @@ def predict_cli(
 
             metadata = SceneMetaData(intrinsics[0, 0].item(), (width, height), "linearRGB")
 
+            render_start = perf_counter()
             render_gaussians(
                 gaussians=gaussians,
                 metadata=metadata,
                 output_path=output_video_path,
                 sbs_image_path=sbs_image_path,
                 sbs_image_frame=sbs_image_frame,
+                metrics=metrics,
             )
+            metrics.add_time("render_total", perf_counter() - render_start)
+        metrics.add_time("per_image_total", perf_counter() - image_start)
+    metrics.add_time("run_total", perf_counter() - run_start)
+    _log_metrics_summary(metrics)
 
 
 def predict_image(
@@ -296,11 +318,13 @@ def predict_image(
     device: torch.device,
     amp_enabled: bool,
     amp_dtype: torch.dtype,
+    metrics: Metrics | None = None,
 ) -> Gaussians3D:
     """Predict Gaussians from an image."""
     internal_shape = (1536, 1536)
 
     LOGGER.info("Running preprocessing.")
+    preprocess_start = perf_counter() if metrics else None
     image_pt = torch.from_numpy(image.copy()).float().to(device).permute(2, 0, 1) / 255.0
     _, height, width = image_pt.shape
     disparity_factor = torch.tensor([f_px / width]).float().to(device)
@@ -311,17 +335,23 @@ def predict_image(
         mode="bilinear",
         align_corners=True,
     )
+    if metrics and preprocess_start is not None:
+        metrics.add_time("preprocess", perf_counter() - preprocess_start)
 
     # Predict Gaussians in the NDC space.
     LOGGER.info("Running inference.")
+    forward_start = perf_counter() if metrics else None
     with torch.inference_mode():
         if amp_enabled and device.type == "cuda":
             with torch.autocast(device_type="cuda", dtype=amp_dtype):
                 gaussians_ndc = predictor(image_resized_pt, disparity_factor)
         else:
             gaussians_ndc = predictor(image_resized_pt, disparity_factor)
+    if metrics and forward_start is not None:
+        metrics.add_time("model_forward", perf_counter() - forward_start)
 
     LOGGER.info("Running postprocessing.")
+    postprocess_start = perf_counter() if metrics else None
     gaussians_ndc = Gaussians3D(
         mean_vectors=gaussians_ndc.mean_vectors.float(),
         singular_values=gaussians_ndc.singular_values.float(),
@@ -373,7 +403,61 @@ def predict_image(
 
     # Convert Gaussians to metrics space.
     gaussians = unproject_gaussians(
-        gaussians_ndc, torch.eye(4).to(device), intrinsics_resized, internal_shape
+        gaussians_ndc,
+        torch.eye(4).to(device),
+        intrinsics_resized,
+        internal_shape,
+        metrics=metrics,
     )
+    if metrics and postprocess_start is not None:
+        metrics.add_time("postprocess", perf_counter() - postprocess_start)
 
     return gaussians
+
+
+def _log_metrics_summary(metrics: Metrics) -> None:
+    summary = metrics.summarize()
+    if not summary:
+        return
+
+    stage_order = [
+        "io_decode",
+        "preprocess",
+        "model_forward",
+        "postprocess",
+        "unproject_total",
+        "apply_transform",
+        "decompose_covariance",
+        "render_total",
+        "save_ply",
+        "per_image_total",
+        "run_total",
+    ]
+
+    header = f"{'Stage':<30} {'mean(s)':>10} {'p50(s)':>10} {'p90(s)':>10} {'total(s)':>10}"
+    lines = [header]
+    for name in stage_order:
+        stats = summary.get(name)
+        if stats is None:
+            continue
+        lines.append(
+            f"{name:<30} "
+            f"{stats['mean']:>10.4f} "
+            f"{stats['p50']:>10.4f} "
+            f"{stats['p90']:>10.4f} "
+            f"{stats['total']:>10.4f}"
+        )
+    LOGGER.info("Timing summary (seconds):\n%s", "\n".join(lines))
+
+    counter_order = [
+        "cov_nonfinite",
+        "eigh_retry_chunks",
+        "eigh_cpu_fallback",
+        "ortho_warn",
+        "render_calls",
+        "render_frames",
+    ]
+    counter_lines = ["Counters:"]
+    for name in counter_order:
+        counter_lines.append(f"  {name}={metrics.counters.get(name, 0)}")
+    LOGGER.info("%s", "\n".join(counter_lines))
