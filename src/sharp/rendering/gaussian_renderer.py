@@ -19,9 +19,13 @@ def render_gaussians(
     params: camera.TrajectoryParams | None = None,
     sbs_image_path: Path | None = None,
     sbs_image_frame: int = 0,
-    align_stereo: bool = True,
+    align_stereo: bool = False,
 ) -> None:
-    """Render a single gaussian checkpoint file."""
+    """Render a single gaussian checkpoint file.
+
+    Stereo alignment is disabled by default and only occurs when align_stereo=True
+    is explicitly passed by the caller.
+    """
     (width, height) = metadata.resolution_px
     f_px = metadata.focal_length_px
 
@@ -52,10 +56,6 @@ def render_gaussians(
 
     # Number of camera animation loops.
     params.num_repeats = 3
-
-    # Use static trajectory for SBS image mode
-    if sbs_image_path is not None:
-        params.type = "static"
 
     trajectory = camera.create_eye_trajectory(
         gaussians, params, resolution_px=metadata.resolution_px, f_px=f_px
@@ -109,6 +109,7 @@ def render_gaussians(
             color_l_np = color_l.detach().cpu().numpy()
             color_r_np = color_r.detach().cpu().numpy()
 
+            # NOTE: Alignment must be explicitly enabled by the caller.
             if align_stereo:
                 # Import lazily so OpenCV isn't required unless alignment is used.
                 try:

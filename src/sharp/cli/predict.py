@@ -20,7 +20,7 @@ from sharp.models import (
     RGBGaussianPredictor,
     create_predictor,
 )
-from sharp.utils import io
+from sharp.utils import camera, io
 from sharp.utils import logging as logging_utils
 from sharp.utils.gaussians import (
     Gaussians3D,
@@ -214,6 +214,9 @@ def predict_cli(
             sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
 
         if want_video or sbs_image_path is not None:
+            render_params = None
+            if sbs_image_path is not None:
+                render_params = camera.TrajectoryParams(type="static")
             if want_video:
                 output_video_path = (out_dir / image_path.stem).with_suffix(".mp4")
                 LOGGER.info("Rendering trajectory to %s", output_video_path)
@@ -226,6 +229,7 @@ def predict_cli(
             render_gaussians(
                 gaussians=gaussians,
                 metadata=metadata,
+                params=render_params,
                 output_path=output_video_path,
                 sbs_image_path=sbs_image_path,
                 sbs_image_frame=sbs_image_frame,
