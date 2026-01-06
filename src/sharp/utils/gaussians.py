@@ -230,7 +230,7 @@ def decompose_covariance_matrices(
     )
     if valid_indices.numel() > 0:
         chunk_size = 1024
-        LOGGER.warning(
+        LOGGER.debug(
             "Attempting batched EIGH on %d matrices with chunk_size=%d.",
             int(valid_indices.numel()),
             chunk_size,
@@ -293,18 +293,36 @@ def decompose_covariance_matrices(
 
     # NOTE: it is possible that eigenvectors form a reflection. Correct to rotation.
     det = torch.linalg.det(evecs)
-    num_reflections = int((det < 0).sum().item())
-    if num_reflections > 0:
-        LOGGER.warning(
-            "Received %d reflection matrices from EIGH. Flipping them to rotations.",
-            num_reflections,
-        )
-        if metrics:
-            metrics.inc("ortho_warn", num_reflections)
-        evecs = evecs.clone()
-        evecs[..., :, -1] *= torch.where((det < 0)[..., None], -1.0, 1.0).to(
-            evecs.dtype
-        )
+    reflection_mask = det < 0
+    evecs = evecs.clone()
+    evecs[..., :, -1] *= torch.where(reflection_mask[..., None], -1.0, 1.0).to(
+        evecs.dtype
+    )
+    if LOGGER.isEnabledFor(logging.DEBUG):
+        flat_mask = reflection_mask.reshape(-1)
+        n = flat_mask.numel()
+        k = min(4096, n)
+        if k > 0:
+            idx = torch.randint(0, n, (k,), device=flat_mask.device)
+            sample_mask = flat_mask[idx]
+            frac = sample_mask.float().mean().item()
+            r_mats = evecs.reshape(-1, 3, 3)[idx]
+            rtr = r_mats.transpose(-1, -2) @ r_mats
+            identity = torch.eye(3, device=r_mats.device, dtype=r_mats.dtype)
+            ortho_err = (rtr - identity).abs().max().item()
+            LOGGER.debug(
+                "EIGH diagnostics (sampled k=%d): reflection_frac=%.3f ortho_max=%.2e",
+                k,
+                frac,
+                ortho_err,
+            )
+            if metrics:
+                metrics.inc("reflection_sampled_k", k)
+                metrics.inc("reflection_sampled_hits", int(sample_mask.sum().item()))
+            if ortho_err > 1e-2:
+                LOGGER.warning(
+                    "EIGH orthonormality max|RtR-I| too high (sampled): %.2e", ortho_err
+                )
 
     quaternions = linalg.quaternions_from_rotation_matrices(evecs)
     quaternions = quaternions.to(dtype=dtype, device=device)
