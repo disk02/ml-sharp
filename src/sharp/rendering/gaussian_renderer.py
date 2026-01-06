@@ -19,6 +19,7 @@ def render_gaussians(
     params: camera.TrajectoryParams | None = None,
     sbs_image_path: Path | None = None,
     sbs_image_frame: int = 0,
+    align_stereo: bool = False,
 ) -> None:
     """Render a single gaussian checkpoint file."""
     (width, height) = metadata.resolution_px
@@ -104,26 +105,30 @@ def render_gaussians(
 
         # Write SBS frame image if requested
         if sbs_image_path is not None and frame_idx == sbs_image_frame:
-            # Import lazily so OpenCV isn't required unless --sbs-image is used.
-            try:
-                from sharp.utils.stereo_align import AlignParams, auto_align_and_crop
-            except ImportError as e:  # pragma: no cover
-                raise RuntimeError(
-                    "Stereo auto-alignment requires OpenCV. Install opencv-python "
-                    "(or opencv-python-headless)."
-                ) from e
+            if align_stereo:
+                # Import lazily so OpenCV isn't required unless alignment is enabled.
+                try:
+                    from sharp.utils.stereo_align import AlignParams, auto_align_and_crop
+                except ImportError as e:  # pragma: no cover
+                    raise RuntimeError(
+                        "Stereo auto-alignment requires OpenCV. Install opencv-python "
+                        "(or opencv-python-headless)."
+                    ) from e
 
-            # Convert torch -> numpy (H,W,3) uint8
-            color_l_np = color_l.detach().cpu().numpy()
-            color_r_np = color_r.detach().cpu().numpy()
+                # Convert torch -> numpy (H,W,3) uint8
+                color_l_np = color_l.detach().cpu().numpy()
+                color_r_np = color_r.detach().cpu().numpy()
 
-            # Auto-align + auto-crop the stereo pair, then re-pack SBS for output.
-            align_params = AlignParams()
-            color_l_aligned, color_r_aligned, _meta = auto_align_and_crop(
-                color_l_np, color_r_np, params=align_params
-            )
+                # Auto-align + auto-crop the stereo pair, then re-pack SBS for output.
+                align_params = AlignParams()
+                color_l_aligned, color_r_aligned, _meta = auto_align_and_crop(
+                    color_l_np, color_r_np, params=align_params
+                )
 
-            color_sbs_np = np.concatenate((color_l_aligned, color_r_aligned), axis=1)
+                color_sbs_np = np.concatenate((color_l_aligned, color_r_aligned), axis=1)
+            else:
+                color_sbs_np = color.detach().cpu().numpy()
+
             img = Image.fromarray(color_sbs_np, mode="RGB")
             sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
             img.save(sbs_image_path)

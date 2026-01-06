@@ -70,12 +70,19 @@ def _resolve_sbs_image_path(
     default=0,
     help="Frame index to save for --sbs-image (default: 0).",
 )
+@click.option(
+    "--align-stereo",
+    is_flag=True,
+    default=False,
+    help="Enable stereo alignment and automatic overlap crop before saving SBS output.",
+)
 def render_cli(
     input_path: Path,
     output_path: Path,
     verbose: bool,
     sbs_image: Path | None,
     sbs_image_frame: int,
+    align_stereo: bool,
 ):
     """Render 3DGS PLY files to SBS video (and optionally an SBS frame image)."""
     logging_utils.configure(logging.DEBUG if verbose else logging.INFO)
@@ -106,5 +113,5 @@ def render_cli(
             output_path=(output_path / scene_path.stem).with_suffix(".mp4"),
             sbs_image_path=_resolve_sbs_image_path(sbs_image, scene_path),
             sbs_image_frame=sbs_image_frame,
+            align_stereo=align_stereo,
         )
-
