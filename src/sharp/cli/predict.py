@@ -52,6 +52,49 @@ class PredictionResult:
     unprojection_matrix: torch.Tensor | None = None
 
 
+def _align_for_compare(
+    baseline_img: np.ndarray, fast_img: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    def _normalize_channels(img: np.ndarray) -> np.ndarray:
+        if img.ndim == 2:
+            return np.repeat(img[:, :, None], 3, axis=2)
+        if img.ndim == 3 and img.shape[2] == 4:
+            return img[:, :, :3]
+        if img.ndim == 3 and img.shape[2] == 3:
+            return img
+        raise click.ClickException(f"Unsupported image shape for compare: {img.shape}")
+
+    baseline_img = _normalize_channels(baseline_img)
+    fast_img = _normalize_channels(fast_img)
+
+    if baseline_img.shape == fast_img.shape:
+        return baseline_img, fast_img
+
+    h = min(baseline_img.shape[0], fast_img.shape[0])
+    w = min(baseline_img.shape[1], fast_img.shape[1])
+    if h <= 0 or w <= 0:
+        raise click.ClickException(
+            f"Invalid compare crop size from shapes {baseline_img.shape} and {fast_img.shape}."
+        )
+
+    def _center_crop(img: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
+        h0, w0 = img.shape[:2]
+        top = max((h0 - target_h) // 2, 0)
+        left = max((w0 - target_w) // 2, 0)
+        return img[top : top + target_h, left : left + target_w]
+
+    baseline_crop = _center_crop(baseline_img, h, w)
+    fast_crop = _center_crop(fast_img, h, w)
+    LOGGER.info(
+        "Aligned compare shapes: baseline=%s fast=%s -> compared=(%d, %d, 3)",
+        baseline_img.shape,
+        fast_img.shape,
+        h,
+        w,
+    )
+    return baseline_crop, fast_crop
+
+
 @click.command()
 @click.option(
     "-i",
@@ -403,12 +446,18 @@ def predict_cli(
                 )
                 if fast_preview_compare and sbs_image_path is not None:
                     try:
-                        baseline_img = np.asarray(io.load_rgb(baseline_path)[0], dtype=np.float32) / 255.0
-                        fast_img = np.asarray(io.load_rgb(sbs_image_path)[0], dtype=np.float32) / 255.0
+                        baseline_img = np.asarray(io.load_rgb(baseline_path)[0])
+                        fast_img = np.asarray(io.load_rgb(sbs_image_path)[0])
+                        baseline_img, fast_img = _align_for_compare(baseline_img, fast_img)
+                        baseline_img = baseline_img.astype(np.float32) / 255.0
+                        fast_img = fast_img.astype(np.float32) / 255.0
                         diff = np.abs(baseline_img - fast_img)
                         mae = float(diff.mean())
                         max_err = float(diff.max())
+                        mse = float(np.mean(diff * diff))
+                        psnr = float("inf") if mse == 0 else 20.0 * np.log10(1.0 / np.sqrt(mse))
                         LOGGER.info("Fast preview compare: MAE=%.6f Max=%.6f", mae, max_err)
+                        LOGGER.info("Fast preview compare: PSNR=%.2f dB", psnr)
                     finally:
                         if baseline_path.exists():
                             baseline_path.unlink()
