@@ -179,18 +179,35 @@ def render_gaussians_pred_space(
         device=device,
         dtype=torch.float32,
     )
-    unprojection_matrix = unprojection_matrix.to(device=device, dtype=torch.float32)
-    transform = unprojection_matrix[:3]
-    mean_vectors = gaussians.mean_vectors @ transform[:3, :3].T + transform[:3, 3]
-    gaussians_for_camera = Gaussians3D(
-        mean_vectors=mean_vectors,
-        singular_values=gaussians.singular_values,
-        quaternions=gaussians.quaternions,
-        colors=gaussians.colors,
-        opacities=gaussians.opacities,
+    u_pred_to_world = unprojection_matrix.to(device=device, dtype=torch.float32)
+
+    mean_vectors = gaussians.mean_vectors
+    if mean_vectors.ndim == 3:
+        mean_vectors = mean_vectors[0]
+    num_points = int(mean_vectors.shape[0])
+    sample_size = min(16384, num_points)
+    sample_idx = torch.randint(0, num_points, (sample_size,), device=mean_vectors.device)
+    mean_sample = mean_vectors[sample_idx]
+    mean_sample_world = mean_sample @ u_pred_to_world[:3, :3].T + u_pred_to_world[:3, 3]
+    mean_sample_world = mean_sample_world.unsqueeze(0)
+    quaternions = gaussians.quaternions
+    singular_values = gaussians.singular_values
+    colors = gaussians.colors
+    opacities = gaussians.opacities
+    if quaternions.ndim == 3:
+        quaternions = quaternions[0][sample_idx].unsqueeze(0)
+        singular_values = singular_values[0][sample_idx].unsqueeze(0)
+        colors = colors[0][sample_idx].unsqueeze(0)
+        opacities = opacities[0][sample_idx].unsqueeze(0)
+    gaussians_camera_sample = Gaussians3D(
+        mean_vectors=mean_sample_world,
+        singular_values=singular_values,
+        quaternions=quaternions,
+        colors=colors,
+        opacities=opacities,
     )
     camera_model = camera.create_camera_model(
-        gaussians_for_camera, intrinsics, resolution_px=metadata.resolution_px
+        gaussians_camera_sample, intrinsics, resolution_px=metadata.resolution_px
     )
 
     baseline = 0.065
@@ -199,7 +216,7 @@ def render_gaussians_pred_space(
         params.type = "static"
 
     trajectory = camera.create_eye_trajectory(
-        gaussians_for_camera, params, resolution_px=metadata.resolution_px, f_px=f_px
+        gaussians_camera_sample, params, resolution_px=metadata.resolution_px, f_px=f_px
     )
     renderer = gsplat.GSplatRenderer(color_space=metadata.color_space)
 
@@ -214,7 +231,7 @@ def render_gaussians_pred_space(
         eye_position_r[0] += baseline * 0.5
 
         camera_info = camera_model.compute(eye_position_l)
-        extrinsics_l = camera_info.extrinsics.to(device) @ unprojection_matrix
+        extrinsics_l = camera_info.extrinsics.to(device) @ u_pred_to_world
         rendering_output = renderer(
             gaussians.to(device),
             extrinsics=extrinsics_l[None],
@@ -228,7 +245,7 @@ def render_gaussians_pred_space(
         depth_l = rendering_output.depth[0]
 
         camera_info = camera_model.compute(eye_position_r)
-        extrinsics_r = camera_info.extrinsics.to(device) @ unprojection_matrix
+        extrinsics_r = camera_info.extrinsics.to(device) @ u_pred_to_world
         rendering_output = renderer(
             gaussians.to(device),
             extrinsics=extrinsics_r[None],

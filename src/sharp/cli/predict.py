@@ -108,6 +108,12 @@ class PredictionResult:
     help="Render SBS preview using predicted-space gaussians (skips world conversion).",
 )
 @click.option(
+    "--fast-preview-compare",
+    is_flag=True,
+    default=False,
+    help="Compare fast preview render against baseline SBS rendering.",
+)
+@click.option(
     "--save-ply/--no-save-ply",
     default=None,
     show_default=False,
@@ -148,6 +154,7 @@ def predict_cli(
     sbs_image: Path | None,
     sbs_image_frame: int,
     fast_preview_render: bool,
+    fast_preview_compare: bool,
     save_ply: bool | None,
     skip_world_conversion: bool,
     device: str,
@@ -233,6 +240,10 @@ def predict_cli(
     if fast_preview_render and not want_sbs_image:
         LOGGER.warning("--fast-preview-render is only used with --sbs-image. Disabling.")
         fast_preview_render = False
+    if fast_preview_compare and not want_sbs_image:
+        raise click.ClickException("--fast-preview-compare requires --sbs-image.")
+    if fast_preview_compare and not fast_preview_render:
+        raise click.ClickException("--fast-preview-compare requires --fast-preview-render.")
     if fast_preview_render and want_video:
         raise click.ClickException(
             "--fast-preview-render is only supported for --sbs-image (not --render)."
@@ -265,7 +276,12 @@ def predict_cli(
             device=device,
             dtype=torch.float32,
         )
-        want_world = effective_save_ply or want_video or (want_sbs_image and not fast_preview_render)
+        want_world = (
+            effective_save_ply
+            or want_video
+            or (want_sbs_image and not fast_preview_render)
+            or fast_preview_compare
+        )
         if skip_world_conversion and want_world:
             raise click.ClickException(
                 "World-space conversion is required for rendering or PLY export. "
@@ -356,6 +372,26 @@ def predict_cli(
                     raise click.ClickException(
                         "Missing unprojection matrix for fast preview rendering."
                     )
+                if fast_preview_compare:
+                    if prediction.world is None:
+                        raise click.ClickException(
+                            "World-space Gaussians missing; compare requires world conversion."
+                        )
+                    if sbs_image_path is None:
+                        raise click.ClickException(
+                            "--fast-preview-compare requires --sbs-image."
+                        )
+                    baseline_path = sbs_image_path.with_name(
+                        f"{sbs_image_path.stem}_baseline{sbs_image_path.suffix}"
+                    )
+                    render_gaussians(
+                        gaussians=prediction.world,
+                        metadata=metadata,
+                        output_path=output_video_path,
+                        sbs_image_path=baseline_path,
+                        sbs_image_frame=sbs_image_frame,
+                        metrics=metrics,
+                    )
                 render_gaussians_pred_space(
                     gaussians=prediction.pred,
                     metadata=metadata,
@@ -365,6 +401,17 @@ def predict_cli(
                     sbs_image_frame=sbs_image_frame,
                     metrics=metrics,
                 )
+                if fast_preview_compare and sbs_image_path is not None:
+                    try:
+                        baseline_img = np.asarray(io.load_rgb(baseline_path)[0], dtype=np.float32) / 255.0
+                        fast_img = np.asarray(io.load_rgb(sbs_image_path)[0], dtype=np.float32) / 255.0
+                        diff = np.abs(baseline_img - fast_img)
+                        mae = float(diff.mean())
+                        max_err = float(diff.max())
+                        LOGGER.info("Fast preview compare: MAE=%.6f Max=%.6f", mae, max_err)
+                    finally:
+                        if baseline_path.exists():
+                            baseline_path.unlink()
             else:
                 if prediction.world is None:
                     raise click.ClickException(
