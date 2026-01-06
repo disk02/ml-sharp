@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import logging
 from time import perf_counter
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import click
 import numpy as np
@@ -36,6 +38,13 @@ from sharp.rendering.gaussian_renderer import render_gaussians
 LOGGER = logging.getLogger(__name__)
 
 DEFAULT_MODEL_URL = "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh.pt"
+GaussianSpace = Literal["pred", "world"]
+
+
+@dataclass(frozen=True)
+class PredictionResult:
+    pred: Gaussians3D
+    world: Gaussians3D | None = None
 
 
 @click.command()
@@ -94,6 +103,12 @@ DEFAULT_MODEL_URL = "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh
     help="Whether to save the predicted Gaussians as .ply.",
 )
 @click.option(
+    "--skip-world-conversion",
+    is_flag=True,
+    default=False,
+    help="Skip unproject/apply_transform world-space conversion (fast path).",
+)
+@click.option(
     "--device",
     type=str,
     default="default",
@@ -122,6 +137,7 @@ def predict_cli(
     sbs_image: Path | None,
     sbs_image_frame: int,
     save_ply: bool | None,
+    skip_world_conversion: bool,
     device: str,
     amp: bool | None,
     amp_dtype: str,
@@ -230,8 +246,19 @@ def predict_cli(
             device=device,
             dtype=torch.float32,
         )
+        want_world = effective_save_ply or want_video or want_sbs_image
+        if skip_world_conversion and want_world:
+            raise click.ClickException(
+                "World-space conversion is required for rendering or PLY export. "
+                "Disable --skip-world-conversion or disable those outputs."
+            )
+        if skip_world_conversion:
+            LOGGER.info("Skipping world conversion (unproject/apply_transform).")
+        space: GaussianSpace = "world" if want_world else "pred"
+        LOGGER.info("Computing world-space gaussians: %s", "yes" if space == "world" else "no")
+
         predict_start = perf_counter()
-        gaussians = predict_image(
+        prediction = predict_image(
             gaussian_predictor,
             image,
             f_px,
@@ -239,13 +266,18 @@ def predict_cli(
             amp_enabled=amp,
             amp_dtype=amp_autocast_dtype,
             metrics=metrics,
+            return_world=want_world,
         )
         metrics.add_time("predict_total", perf_counter() - predict_start)
 
         if effective_save_ply:
             LOGGER.info("Saving 3DGS to %s", output_path)
+            if prediction.world is None:
+                raise click.ClickException(
+                    "World-space Gaussians missing; cannot export PLY without conversion."
+                )
             save_ply(
-                gaussians,
+                prediction.world,
                 f_px,
                 (height, width),
                 out_dir / f"{image_path.stem}.ply",
@@ -294,11 +326,15 @@ def predict_cli(
                 # Placeholder path; render_gaussians will not write video when sbs_image_path is set.
                 output_video_path = (out_dir / image_path.stem).with_suffix(".mp4")
 
+            if prediction.world is None:
+                raise click.ClickException(
+                    "World-space Gaussians missing; rendering requires world conversion."
+                )
             metadata = SceneMetaData(intrinsics[0, 0].item(), (width, height), "linearRGB")
 
             render_start = perf_counter()
             render_gaussians(
-                gaussians=gaussians,
+                gaussians=prediction.world,
                 metadata=metadata,
                 output_path=output_video_path,
                 sbs_image_path=sbs_image_path,
@@ -319,7 +355,8 @@ def predict_image(
     amp_enabled: bool,
     amp_dtype: torch.dtype,
     metrics: Metrics | None = None,
-) -> Gaussians3D:
+    return_world: bool = True,
+) -> PredictionResult:
     """Predict Gaussians from an image."""
     internal_shape = (1536, 1536)
 
@@ -385,34 +422,37 @@ def predict_image(
         colors=gaussians_ndc.colors,
         opacities=gaussians_ndc.opacities,
     )
-    intrinsics = (
-        torch.tensor(
-            [
-                [f_px, 0, width / 2, 0],
-                [0, f_px, height / 2, 0],
-                [0, 0, 1, 0],
-                [0, 0, 0, 1],
-            ]
-        )
-        .float()
-        .to(device)
-    )
-    intrinsics_resized = intrinsics.clone()
-    intrinsics_resized[0] *= internal_shape[0] / width
-    intrinsics_resized[1] *= internal_shape[1] / height
 
-    # Convert Gaussians to metrics space.
-    gaussians = unproject_gaussians(
-        gaussians_ndc,
-        torch.eye(4).to(device),
-        intrinsics_resized,
-        internal_shape,
-        metrics=metrics,
-    )
+    gaussians_world = None
+    if return_world:
+        intrinsics = (
+            torch.tensor(
+                [
+                    [f_px, 0, width / 2, 0],
+                    [0, f_px, height / 2, 0],
+                    [0, 0, 1, 0],
+                    [0, 0, 0, 1],
+                ]
+            )
+            .float()
+            .to(device)
+        )
+        intrinsics_resized = intrinsics.clone()
+        intrinsics_resized[0] *= internal_shape[0] / width
+        intrinsics_resized[1] *= internal_shape[1] / height
+
+        # Convert Gaussians to metrics space.
+        gaussians_world = unproject_gaussians(
+            gaussians_ndc,
+            torch.eye(4).to(device),
+            intrinsics_resized,
+            internal_shape,
+            metrics=metrics,
+        )
     if metrics and postprocess_start is not None:
         metrics.add_time("postprocess", perf_counter() - postprocess_start)
 
-    return gaussians
+    return PredictionResult(pred=gaussians_ndc, world=gaussians_world)
 
 
 def _log_metrics_summary(metrics: Metrics) -> None:
@@ -428,6 +468,7 @@ def _log_metrics_summary(metrics: Metrics) -> None:
         "unproject_total",
         "apply_transform",
         "decompose_covariance",
+        "predict_total",
         "render_total",
         "save_ply",
         "per_image_total",
