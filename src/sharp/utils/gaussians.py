@@ -7,6 +7,7 @@ Copyright (C) 2025 Apple Inc. All Rights Reserved.
 from __future__ import annotations
 
 import logging
+from time import perf_counter
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
@@ -16,6 +17,7 @@ from plyfile import PlyData, PlyElement
 
 from sharp.utils import color_space as cs_utils
 from sharp.utils import linalg
+from sharp.utils.metrics import Metrics
 
 LOGGER = logging.getLogger(__name__)
 
@@ -91,14 +93,20 @@ def unproject_gaussians(
     extrinsics: torch.Tensor,
     intrinsics: torch.Tensor,
     image_shape: tuple[int, int],
+    metrics: Metrics | None = None,
 ) -> Gaussians3D:
     """Unproject Gaussians from NDC space to world coordinates."""
+    start_time = perf_counter() if metrics else None
     unprojection_matrix = get_unprojection_matrix(extrinsics, intrinsics, image_shape)
-    gaussians = apply_transform(gaussians_ndc, unprojection_matrix[:3])
+    gaussians = apply_transform(gaussians_ndc, unprojection_matrix[:3], metrics=metrics)
+    if metrics and start_time is not None:
+        metrics.add_time("unproject_total", perf_counter() - start_time)
     return gaussians
 
 
-def apply_transform(gaussians: Gaussians3D, transform: torch.Tensor) -> Gaussians3D:
+def apply_transform(
+    gaussians: Gaussians3D, transform: torch.Tensor, metrics: Metrics | None = None
+) -> Gaussians3D:
     """Apply an affine transformation to 3D Gaussians.
 
     Args:
@@ -110,6 +118,7 @@ def apply_transform(gaussians: Gaussians3D, transform: torch.Tensor) -> Gaussian
 
     Note: This operation is not differentiable.
     """
+    start_time = perf_counter() if metrics else None
     transform_linear = transform[..., :3, :3]
     transform_offset = transform[..., :3, 3]
 
@@ -120,7 +129,11 @@ def apply_transform(gaussians: Gaussians3D, transform: torch.Tensor) -> Gaussian
     covariance_matrices = (
         transform_linear @ covariance_matrices @ transform_linear.transpose(-1, -2)
     )
-    quaternions, singular_values = decompose_covariance_matrices(covariance_matrices)
+    quaternions, singular_values = decompose_covariance_matrices(
+        covariance_matrices, metrics=metrics
+    )
+    if metrics and start_time is not None:
+        metrics.add_time("apply_transform", perf_counter() - start_time)
 
     return Gaussians3D(
         mean_vectors=mean_vectors,
@@ -133,6 +146,7 @@ def apply_transform(gaussians: Gaussians3D, transform: torch.Tensor) -> Gaussian
 
 def decompose_covariance_matrices(
     covariance_matrices: torch.Tensor,
+    metrics: Metrics | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Decompose 3D covariance matrices into quaternions and singular values.
 
@@ -145,6 +159,7 @@ def decompose_covariance_matrices(
 
     Note: This operation is not differentiable.
     """
+    start_time = perf_counter() if metrics else None
     device = covariance_matrices.device
     dtype = covariance_matrices.dtype
 
@@ -168,18 +183,27 @@ def decompose_covariance_matrices(
         dtype=covariance_matrices.dtype,
     )
 
-    num_invalid = int((~flat_mask).sum().item())
-    if num_invalid > 0:
+    invalid_indices = (~flat_mask).nonzero(as_tuple=False).flatten()
+    invalid_count = int(invalid_indices.numel())
+    need_invalid_count = (
+        metrics is not None
+        or LOGGER.isEnabledFor(logging.DEBUG)
+        or LOGGER.isEnabledFor(logging.WARNING)
+    )
+    num_invalid = invalid_count if need_invalid_count else None
+    if num_invalid is not None and num_invalid > 0:
         LOGGER.warning(
             "Received %d non-finite covariance matrices. Falling back to CPU for them.",
             num_invalid,
         )
+        if metrics:
+            metrics.inc("cov_nonfinite", num_invalid)
 
     def _cpu_eigh(covariances: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         evals, evecs = torch.linalg.eigh(covariances)
         return evals, evecs
 
-    cpu_fallbacks = num_invalid
+    cpu_fallbacks = invalid_count
 
     eye3 = torch.eye(
         3, device=covariance_matrices.device, dtype=covariance_matrices.dtype
@@ -187,7 +211,7 @@ def decompose_covariance_matrices(
 
     def _batched_eigh_chunked(
         indices: torch.Tensor, chunk_size: int, jitter: float | None = None
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, int]:
         failed_chunks: list[torch.Tensor] = []
         for i in range(0, indices.numel(), chunk_size):
             chunk = indices[i : i + chunk_size]
@@ -201,10 +225,11 @@ def decompose_covariance_matrices(
             except RuntimeError:
                 failed_chunks.append(chunk)
         if not failed_chunks:
-            return torch.empty(
-                (0,), device=indices.device, dtype=indices.dtype
+            return (
+                torch.empty((0,), device=indices.device, dtype=indices.dtype),
+                0,
             )
-        return torch.cat(failed_chunks, dim=0)
+        return torch.cat(failed_chunks, dim=0), len(failed_chunks)
 
     valid_indices = flat_mask.nonzero(as_tuple=False).flatten()
     failed_indices = torch.empty(
@@ -212,31 +237,33 @@ def decompose_covariance_matrices(
     )
     if valid_indices.numel() > 0:
         chunk_size = 1024
-        LOGGER.warning(
+        LOGGER.debug(
             "Attempting batched EIGH on %d matrices with chunk_size=%d.",
             int(valid_indices.numel()),
             chunk_size,
         )
-        failed_indices = _batched_eigh_chunked(valid_indices, chunk_size)
+        failed_indices, failed_chunks = _batched_eigh_chunked(valid_indices, chunk_size)
         if failed_indices.numel() > 0:
+            if metrics:
+                metrics.inc("eigh_retry_chunks", failed_chunks)
             chunk_size = max(16, chunk_size // 4)
             LOGGER.warning(
                 "Retrying batched EIGH on %d matrices with chunk_size=%d.",
                 int(failed_indices.numel()),
                 chunk_size,
             )
-            failed_indices = _batched_eigh_chunked(
+            failed_indices, _ = _batched_eigh_chunked(
                 failed_indices, chunk_size, jitter=1e-8
             )
 
-    if num_invalid > 0:
+    if invalid_count > 0:
         evals_invalid, evecs_invalid = _cpu_eigh(
-            flat_covariances[~flat_mask].cpu().to(torch.float64)
+            flat_covariances[invalid_indices].cpu().to(torch.float64)
         )
-        flat_evals[~flat_mask] = evals_invalid.to(
+        flat_evals[invalid_indices] = evals_invalid.to(
             device=device, dtype=covariance_matrices.dtype
         )
-        flat_evecs[~flat_mask] = evecs_invalid.to(
+        flat_evecs[invalid_indices] = evecs_invalid.to(
             device=device, dtype=covariance_matrices.dtype
         )
 
@@ -252,12 +279,14 @@ def decompose_covariance_matrices(
             device=device, dtype=covariance_matrices.dtype
         )
 
-    if failed_indices.numel() > 0 or num_invalid > 0:
+    if failed_indices.numel() > 0 or (num_invalid is not None and num_invalid > 0):
         LOGGER.warning(
             "Covariance decomposition fallbacks: failed_indices=%d cpu_fallbacks=%d",
             int(failed_indices.numel()),
             cpu_fallbacks,
         )
+    if metrics and cpu_fallbacks > 0:
+        metrics.inc("eigh_cpu_fallback", cpu_fallbacks)
 
     evals = flat_evals.reshape(*covariance_matrices.shape[:-1])
     evecs = flat_evecs.reshape(*covariance_matrices.shape)
@@ -271,20 +300,42 @@ def decompose_covariance_matrices(
 
     # NOTE: it is possible that eigenvectors form a reflection. Correct to rotation.
     det = torch.linalg.det(evecs)
-    num_reflections = int((det < 0).sum().item())
-    if num_reflections > 0:
-        LOGGER.warning(
-            "Received %d reflection matrices from EIGH. Flipping them to rotations.",
-            num_reflections,
-        )
-        evecs = evecs.clone()
-        evecs[..., :, -1] *= torch.where((det < 0)[..., None], -1.0, 1.0).to(
-            evecs.dtype
-        )
+    reflection_mask = det < 0
+    evecs = evecs.clone()
+    evecs[..., :, -1] *= torch.where(reflection_mask[..., None], -1.0, 1.0).to(
+        evecs.dtype
+    )
+    if LOGGER.isEnabledFor(logging.DEBUG):
+        flat_mask = reflection_mask.reshape(-1)
+        n = flat_mask.numel()
+        k = min(4096, n)
+        if k > 0:
+            idx = torch.randint(0, n, (k,), device=flat_mask.device)
+            sample_mask = flat_mask[idx]
+            frac = sample_mask.float().mean().item()
+            r_mats = evecs.reshape(-1, 3, 3)[idx]
+            rtr = r_mats.transpose(-1, -2) @ r_mats
+            identity = torch.eye(3, device=r_mats.device, dtype=r_mats.dtype)
+            ortho_err = (rtr - identity).abs().max().item()
+            LOGGER.debug(
+                "EIGH diagnostics (sampled k=%d): reflection_frac=%.3f ortho_max=%.2e",
+                k,
+                frac,
+                ortho_err,
+            )
+            if metrics:
+                metrics.inc("reflection_sampled_k", k)
+                metrics.inc("reflection_sampled_hits", int(sample_mask.sum().item()))
+            if ortho_err > 1e-2:
+                LOGGER.warning(
+                    "EIGH orthonormality max|RtR-I| too high (sampled): %.2e", ortho_err
+                )
 
     quaternions = linalg.quaternions_from_rotation_matrices(evecs)
     quaternions = quaternions.to(dtype=dtype, device=device)
     singular_values = torch.sqrt(evals.clamp_min(0.0)).to(dtype=dtype, device=device)
+    if metrics and start_time is not None:
+        metrics.add_time("decompose_covariance", perf_counter() - start_time)
     return quaternions, singular_values
 
 
@@ -464,9 +515,14 @@ def load_ply(path: Path) -> tuple[Gaussians3D, SceneMetaData]:
 
 @torch.no_grad()
 def save_ply(
-    gaussians: Gaussians3D, f_px: float, image_shape: tuple[int, int], path: Path
+    gaussians: Gaussians3D,
+    f_px: float,
+    image_shape: tuple[int, int],
+    path: Path,
+    metrics: Metrics | None = None,
 ) -> PlyData:
     """Save a predicted Gaussian3D to a ply file."""
+    start_time = perf_counter() if metrics else None
 
     def _inverse_sigmoid(tensor: torch.Tensor) -> torch.Tensor:
         return torch.log(tensor / (1.0 - tensor))
@@ -599,4 +655,6 @@ def save_ply(
     )
 
     plydata.write(path)
+    if metrics and start_time is not None:
+        metrics.add_time("save_ply", perf_counter() - start_time)
     return plydata

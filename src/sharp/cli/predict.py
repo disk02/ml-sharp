@@ -7,7 +7,10 @@ Copyright (C) 2025 Apple Inc. All Rights Reserved.
 from __future__ import annotations
 
 import logging
+from time import perf_counter
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import click
 import numpy as np
@@ -25,15 +28,71 @@ from sharp.utils import logging as logging_utils
 from sharp.utils.gaussians import (
     Gaussians3D,
     SceneMetaData,
+    get_unprojection_matrix,
     save_ply,
     unproject_gaussians,
 )
+from sharp.utils.metrics import Metrics
 
-from sharp.rendering.gaussian_renderer import render_gaussians
+from sharp.rendering.gaussian_renderer import (
+    render_gaussians,
+    render_gaussians_pred_space,
+)
 
 LOGGER = logging.getLogger(__name__)
 
 DEFAULT_MODEL_URL = "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh.pt"
+GaussianSpace = Literal["pred", "world"]
+
+
+@dataclass(frozen=True)
+class PredictionResult:
+    pred: Gaussians3D
+    world: Gaussians3D | None = None
+    unprojection_matrix: torch.Tensor | None = None
+
+
+def _align_for_compare(
+    baseline_img: np.ndarray, fast_img: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    def _normalize_channels(img: np.ndarray) -> np.ndarray:
+        if img.ndim == 2:
+            return np.repeat(img[:, :, None], 3, axis=2)
+        if img.ndim == 3 and img.shape[2] == 4:
+            return img[:, :, :3]
+        if img.ndim == 3 and img.shape[2] == 3:
+            return img
+        raise click.ClickException(f"Unsupported image shape for compare: {img.shape}")
+
+    baseline_img = _normalize_channels(baseline_img)
+    fast_img = _normalize_channels(fast_img)
+
+    if baseline_img.shape == fast_img.shape:
+        return baseline_img, fast_img
+
+    h = min(baseline_img.shape[0], fast_img.shape[0])
+    w = min(baseline_img.shape[1], fast_img.shape[1])
+    if h <= 0 or w <= 0:
+        raise click.ClickException(
+            f"Invalid compare crop size from shapes {baseline_img.shape} and {fast_img.shape}."
+        )
+
+    def _center_crop(img: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
+        h0, w0 = img.shape[:2]
+        top = max((h0 - target_h) // 2, 0)
+        left = max((w0 - target_w) // 2, 0)
+        return img[top : top + target_h, left : left + target_w]
+
+    baseline_crop = _center_crop(baseline_img, h, w)
+    fast_crop = _center_crop(fast_img, h, w)
+    LOGGER.info(
+        "Aligned compare shapes: baseline=%s fast=%s -> compared=(%d, %d, 3)",
+        baseline_img.shape,
+        fast_img.shape,
+        h,
+        w,
+    )
+    return baseline_crop, fast_crop
 
 
 @click.command()
@@ -86,10 +145,28 @@ DEFAULT_MODEL_URL = "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh
     help="Which frame index to save for --sbs-image.",
 )
 @click.option(
+    "--fast-preview-render",
+    is_flag=True,
+    default=False,
+    help="Render SBS preview using predicted-space gaussians (skips world conversion).",
+)
+@click.option(
+    "--fast-preview-compare",
+    is_flag=True,
+    default=False,
+    help="Compare fast preview render against baseline SBS rendering.",
+)
+@click.option(
     "--save-ply/--no-save-ply",
     default=None,
     show_default=False,
     help="Whether to save the predicted Gaussians as .ply.",
+)
+@click.option(
+    "--skip-world-conversion",
+    is_flag=True,
+    default=False,
+    help="Skip unproject/apply_transform world-space conversion (fast path).",
 )
 @click.option(
     "--device",
@@ -119,7 +196,10 @@ def predict_cli(
     with_rendering: bool,
     sbs_image: Path | None,
     sbs_image_frame: int,
+    fast_preview_render: bool,
+    fast_preview_compare: bool,
     save_ply: bool | None,
+    skip_world_conversion: bool,
     device: str,
     amp: bool | None,
     amp_dtype: str,
@@ -196,9 +276,21 @@ def predict_cli(
     gaussian_predictor.to(device)
 
     output_path.mkdir(exist_ok=True, parents=True)
+    metrics = Metrics()
 
     want_sbs_image = sbs_image is not None
     want_video = with_rendering
+    if fast_preview_render and not want_sbs_image:
+        LOGGER.warning("--fast-preview-render is only used with --sbs-image. Disabling.")
+        fast_preview_render = False
+    if fast_preview_compare and not want_sbs_image:
+        raise click.ClickException("--fast-preview-compare requires --sbs-image.")
+    if fast_preview_compare and not fast_preview_render:
+        raise click.ClickException("--fast-preview-compare requires --fast-preview-render.")
+    if fast_preview_render and want_video:
+        raise click.ClickException(
+            "--fast-preview-render is only supported for --sbs-image (not --render)."
+        )
     if save_ply is None and want_sbs_image:
         effective_save_ply = False
     elif save_ply is None and not want_sbs_image:
@@ -206,12 +298,16 @@ def predict_cli(
     else:
         effective_save_ply = bool(save_ply)
 
+    run_start = perf_counter()
     for index, image_path in enumerate(image_paths, start=1):
+        image_start = perf_counter()
         rel_path = image_path.relative_to(input_path) if input_is_dir else Path(image_path.name)
         out_dir = output_path / rel_path.parent if input_is_dir else output_path
         out_dir.mkdir(parents=True, exist_ok=True)
         LOGGER.info("Processing %s (%d/%d)", image_path, index, len(image_paths))
+        io_start = perf_counter()
         image, _, f_px = io.load_rgb(image_path)
+        metrics.add_time("io_decode", perf_counter() - io_start)
         height, width = image.shape[:2]
         intrinsics = torch.tensor(
             [
@@ -223,18 +319,51 @@ def predict_cli(
             device=device,
             dtype=torch.float32,
         )
-        gaussians = predict_image(
+        want_world = (
+            effective_save_ply
+            or want_video
+            or (want_sbs_image and not fast_preview_render)
+            or fast_preview_compare
+        )
+        if skip_world_conversion and want_world:
+            raise click.ClickException(
+                "World-space conversion is required for rendering or PLY export. "
+                "Disable --skip-world-conversion or disable those outputs."
+            )
+        if skip_world_conversion:
+            LOGGER.info("Skipping world conversion (unproject/apply_transform).")
+        if fast_preview_render and not want_world:
+            LOGGER.info("Using fast preview render; skipping world conversion.")
+        space: GaussianSpace = "world" if want_world else "pred"
+        LOGGER.info("Computing world-space gaussians: %s", "yes" if space == "world" else "no")
+
+        predict_start = perf_counter()
+        prediction = predict_image(
             gaussian_predictor,
             image,
             f_px,
             torch.device(device),
             amp_enabled=amp,
             amp_dtype=amp_autocast_dtype,
+            metrics=metrics,
+            return_world=want_world,
+            return_unprojection=fast_preview_render,
         )
+        metrics.add_time("predict_total", perf_counter() - predict_start)
 
         if effective_save_ply:
             LOGGER.info("Saving 3DGS to %s", output_path)
-            save_ply(gaussians, f_px, (height, width), out_dir / f"{image_path.stem}.ply")
+            if prediction.world is None:
+                raise click.ClickException(
+                    "World-space Gaussians missing; cannot export PLY without conversion."
+                )
+            save_ply(
+                prediction.world,
+                f_px,
+                (height, width),
+                out_dir / f"{image_path.stem}.ply",
+                metrics=metrics,
+            )
         else:
             if save_ply is None and want_sbs_image:
                 LOGGER.info(
@@ -280,13 +409,75 @@ def predict_cli(
 
             metadata = SceneMetaData(intrinsics[0, 0].item(), (width, height), "linearRGB")
 
-            render_gaussians(
-                gaussians=gaussians,
-                metadata=metadata,
-                output_path=output_video_path,
-                sbs_image_path=sbs_image_path,
-                sbs_image_frame=sbs_image_frame,
-            )
+            render_start = perf_counter()
+            if fast_preview_render:
+                if prediction.unprojection_matrix is None:
+                    raise click.ClickException(
+                        "Missing unprojection matrix for fast preview rendering."
+                    )
+                if fast_preview_compare:
+                    if prediction.world is None:
+                        raise click.ClickException(
+                            "World-space Gaussians missing; compare requires world conversion."
+                        )
+                    if sbs_image_path is None:
+                        raise click.ClickException(
+                            "--fast-preview-compare requires --sbs-image."
+                        )
+                    baseline_path = sbs_image_path.with_name(
+                        f"{sbs_image_path.stem}_baseline{sbs_image_path.suffix}"
+                    )
+                    render_gaussians(
+                        gaussians=prediction.world,
+                        metadata=metadata,
+                        output_path=output_video_path,
+                        sbs_image_path=baseline_path,
+                        sbs_image_frame=sbs_image_frame,
+                        metrics=metrics,
+                    )
+                render_gaussians_pred_space(
+                    gaussians=prediction.pred,
+                    metadata=metadata,
+                    output_path=output_video_path,
+                    unprojection_matrix=prediction.unprojection_matrix,
+                    sbs_image_path=sbs_image_path,
+                    sbs_image_frame=sbs_image_frame,
+                    metrics=metrics,
+                )
+                if fast_preview_compare and sbs_image_path is not None:
+                    try:
+                        baseline_img = np.asarray(io.load_rgb(baseline_path)[0])
+                        fast_img = np.asarray(io.load_rgb(sbs_image_path)[0])
+                        baseline_img, fast_img = _align_for_compare(baseline_img, fast_img)
+                        baseline_img = baseline_img.astype(np.float32) / 255.0
+                        fast_img = fast_img.astype(np.float32) / 255.0
+                        diff = np.abs(baseline_img - fast_img)
+                        mae = float(diff.mean())
+                        max_err = float(diff.max())
+                        mse = float(np.mean(diff * diff))
+                        psnr = float("inf") if mse == 0 else 20.0 * np.log10(1.0 / np.sqrt(mse))
+                        LOGGER.info("Fast preview compare: MAE=%.6f Max=%.6f", mae, max_err)
+                        LOGGER.info("Fast preview compare: PSNR=%.2f dB", psnr)
+                    finally:
+                        if baseline_path.exists():
+                            baseline_path.unlink()
+            else:
+                if prediction.world is None:
+                    raise click.ClickException(
+                        "World-space Gaussians missing; rendering requires world conversion."
+                    )
+                render_gaussians(
+                    gaussians=prediction.world,
+                    metadata=metadata,
+                    output_path=output_video_path,
+                    sbs_image_path=sbs_image_path,
+                    sbs_image_frame=sbs_image_frame,
+                    metrics=metrics,
+                )
+            metrics.add_time("render_total", perf_counter() - render_start)
+        metrics.add_time("per_image_total", perf_counter() - image_start)
+    metrics.add_time("run_total", perf_counter() - run_start)
+    _log_metrics_summary(metrics)
 
 
 def predict_image(
@@ -296,11 +487,15 @@ def predict_image(
     device: torch.device,
     amp_enabled: bool,
     amp_dtype: torch.dtype,
-) -> Gaussians3D:
+    metrics: Metrics | None = None,
+    return_world: bool = True,
+    return_unprojection: bool = False,
+) -> PredictionResult:
     """Predict Gaussians from an image."""
     internal_shape = (1536, 1536)
 
     LOGGER.info("Running preprocessing.")
+    preprocess_start = perf_counter() if metrics else None
     image_pt = torch.from_numpy(image.copy()).float().to(device).permute(2, 0, 1) / 255.0
     _, height, width = image_pt.shape
     disparity_factor = torch.tensor([f_px / width]).float().to(device)
@@ -311,17 +506,23 @@ def predict_image(
         mode="bilinear",
         align_corners=True,
     )
+    if metrics and preprocess_start is not None:
+        metrics.add_time("preprocess", perf_counter() - preprocess_start)
 
     # Predict Gaussians in the NDC space.
     LOGGER.info("Running inference.")
+    forward_start = perf_counter() if metrics else None
     with torch.inference_mode():
         if amp_enabled and device.type == "cuda":
             with torch.autocast(device_type="cuda", dtype=amp_dtype):
                 gaussians_ndc = predictor(image_resized_pt, disparity_factor)
         else:
             gaussians_ndc = predictor(image_resized_pt, disparity_factor)
+    if metrics and forward_start is not None:
+        metrics.add_time("model_forward", perf_counter() - forward_start)
 
     LOGGER.info("Running postprocessing.")
+    postprocess_start = perf_counter() if metrics else None
     gaussians_ndc = Gaussians3D(
         mean_vectors=gaussians_ndc.mean_vectors.float(),
         singular_values=gaussians_ndc.singular_values.float(),
@@ -355,25 +556,91 @@ def predict_image(
         colors=gaussians_ndc.colors,
         opacities=gaussians_ndc.opacities,
     )
-    intrinsics = (
-        torch.tensor(
-            [
-                [f_px, 0, width / 2, 0],
-                [0, f_px, height / 2, 0],
-                [0, 0, 1, 0],
-                [0, 0, 0, 1],
-            ]
+
+    gaussians_world = None
+    unprojection_matrix = None
+    if return_world or return_unprojection:
+        intrinsics = (
+            torch.tensor(
+                [
+                    [f_px, 0, width / 2, 0],
+                    [0, f_px, height / 2, 0],
+                    [0, 0, 1, 0],
+                    [0, 0, 0, 1],
+                ]
+            )
+            .float()
+            .to(device)
         )
-        .float()
-        .to(device)
-    )
-    intrinsics_resized = intrinsics.clone()
-    intrinsics_resized[0] *= internal_shape[0] / width
-    intrinsics_resized[1] *= internal_shape[1] / height
+        intrinsics_resized = intrinsics.clone()
+        intrinsics_resized[0] *= internal_shape[0] / width
+        intrinsics_resized[1] *= internal_shape[1] / height
+        unprojection_matrix = get_unprojection_matrix(
+            torch.eye(4).to(device), intrinsics_resized, internal_shape
+        )
+        if return_world:
+            # Convert Gaussians to metrics space.
+            gaussians_world = unproject_gaussians(
+                gaussians_ndc,
+                torch.eye(4).to(device),
+                intrinsics_resized,
+                internal_shape,
+                metrics=metrics,
+            )
+    if metrics and postprocess_start is not None:
+        metrics.add_time("postprocess", perf_counter() - postprocess_start)
 
-    # Convert Gaussians to metrics space.
-    gaussians = unproject_gaussians(
-        gaussians_ndc, torch.eye(4).to(device), intrinsics_resized, internal_shape
+    return PredictionResult(
+        pred=gaussians_ndc,
+        world=gaussians_world,
+        unprojection_matrix=unprojection_matrix,
     )
 
-    return gaussians
+
+def _log_metrics_summary(metrics: Metrics) -> None:
+    summary = metrics.summarize()
+    if not summary:
+        return
+
+    stage_order = [
+        "io_decode",
+        "preprocess",
+        "model_forward",
+        "postprocess",
+        "unproject_total",
+        "apply_transform",
+        "decompose_covariance",
+        "predict_total",
+        "render_total",
+        "save_ply",
+        "per_image_total",
+        "run_total",
+    ]
+
+    header = f"{'Stage':<30} {'mean(s)':>10} {'p50(s)':>10} {'p90(s)':>10} {'total(s)':>10}"
+    lines = [header]
+    for name in stage_order:
+        stats = summary.get(name)
+        if stats is None:
+            continue
+        lines.append(
+            f"{name:<30} "
+            f"{stats['mean']:>10.4f} "
+            f"{stats['p50']:>10.4f} "
+            f"{stats['p90']:>10.4f} "
+            f"{stats['total']:>10.4f}"
+        )
+    LOGGER.info("Timing summary (seconds):\n%s", "\n".join(lines))
+
+    counter_order = [
+        "cov_nonfinite",
+        "eigh_retry_chunks",
+        "eigh_cpu_fallback",
+        "ortho_warn",
+        "render_calls",
+        "render_frames",
+    ]
+    counter_lines = ["Counters:"]
+    for name in counter_order:
+        counter_lines.append(f"  {name}={metrics.counters.get(name, 0)}")
+    LOGGER.info("%s", "\n".join(counter_lines))
