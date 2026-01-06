@@ -183,8 +183,15 @@ def decompose_covariance_matrices(
         dtype=covariance_matrices.dtype,
     )
 
-    num_invalid = int((~flat_mask).sum().item())
-    if num_invalid > 0:
+    invalid_indices = (~flat_mask).nonzero(as_tuple=False).flatten()
+    invalid_count = int(invalid_indices.numel())
+    need_invalid_count = (
+        metrics is not None
+        or LOGGER.isEnabledFor(logging.DEBUG)
+        or LOGGER.isEnabledFor(logging.WARNING)
+    )
+    num_invalid = invalid_count if need_invalid_count else None
+    if num_invalid is not None and num_invalid > 0:
         LOGGER.warning(
             "Received %d non-finite covariance matrices. Falling back to CPU for them.",
             num_invalid,
@@ -196,7 +203,7 @@ def decompose_covariance_matrices(
         evals, evecs = torch.linalg.eigh(covariances)
         return evals, evecs
 
-    cpu_fallbacks = num_invalid
+    cpu_fallbacks = invalid_count
 
     eye3 = torch.eye(
         3, device=covariance_matrices.device, dtype=covariance_matrices.dtype
@@ -249,14 +256,14 @@ def decompose_covariance_matrices(
                 failed_indices, chunk_size, jitter=1e-8
             )
 
-    if num_invalid > 0:
+    if invalid_count > 0:
         evals_invalid, evecs_invalid = _cpu_eigh(
-            flat_covariances[~flat_mask].cpu().to(torch.float64)
+            flat_covariances[invalid_indices].cpu().to(torch.float64)
         )
-        flat_evals[~flat_mask] = evals_invalid.to(
+        flat_evals[invalid_indices] = evals_invalid.to(
             device=device, dtype=covariance_matrices.dtype
         )
-        flat_evecs[~flat_mask] = evecs_invalid.to(
+        flat_evecs[invalid_indices] = evecs_invalid.to(
             device=device, dtype=covariance_matrices.dtype
         )
 
@@ -272,7 +279,7 @@ def decompose_covariance_matrices(
             device=device, dtype=covariance_matrices.dtype
         )
 
-    if failed_indices.numel() > 0 or num_invalid > 0:
+    if failed_indices.numel() > 0 or (num_invalid is not None and num_invalid > 0):
         LOGGER.warning(
             "Covariance decomposition fallbacks: failed_indices=%d cpu_fallbacks=%d",
             int(failed_indices.numel()),
