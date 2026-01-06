@@ -46,10 +46,18 @@ GaussianSpace = Literal["pred", "world"]
 
 
 @dataclass(frozen=True)
+class UnprojectionContext:
+    intrinsics_resized: torch.Tensor
+    internal_shape: tuple[int, int]
+    device: torch.device
+
+
+@dataclass(frozen=True)
 class PredictionResult:
     pred: Gaussians3D
     world: Gaussians3D | None = None
     unprojection_matrix: torch.Tensor | None = None
+    unprojection_context: UnprojectionContext | None = None
 
 
 def _align_for_compare(
@@ -169,6 +177,19 @@ def _align_for_compare(
     help="Skip unproject/apply_transform world-space conversion (fast path).",
 )
 @click.option(
+    "--defer-world-conversion-for-export/--no-defer-world-conversion-for-export",
+    "defer_world_conversion_for_export",
+    default=False,
+    show_default=True,
+    help="Defer world-space conversion until export to keep preview responsive.",
+)
+@click.option(
+    "--export-fp32",
+    is_flag=True,
+    default=False,
+    help="Compute PLY export conversions in fp32 (even if inference uses AMP).",
+)
+@click.option(
     "--device",
     type=str,
     default="default",
@@ -200,6 +221,8 @@ def predict_cli(
     fast_preview_compare: bool,
     save_ply: bool | None,
     skip_world_conversion: bool,
+    defer_world_conversion_for_export: bool,
+    export_fp32: bool,
     device: str,
     amp: bool | None,
     amp_dtype: str,
@@ -319,22 +342,28 @@ def predict_cli(
             device=device,
             dtype=torch.float32,
         )
-        want_world = (
-            effective_save_ply
-            or want_video
-            or (want_sbs_image and not fast_preview_render)
-            or fast_preview_compare
+        want_world_for_render = (
+            want_video or (want_sbs_image and not fast_preview_render) or fast_preview_compare
         )
-        if skip_world_conversion and want_world:
+        defer_export_world = defer_world_conversion_for_export or (
+            fast_preview_render and not fast_preview_compare
+        )
+        want_world_for_predict = want_world_for_render or (
+            effective_save_ply and not defer_export_world
+        )
+        if skip_world_conversion and (want_world_for_predict or effective_save_ply):
             raise click.ClickException(
                 "World-space conversion is required for rendering or PLY export. "
                 "Disable --skip-world-conversion or disable those outputs."
             )
         if skip_world_conversion:
             LOGGER.info("Skipping world conversion (unproject/apply_transform).")
-        if fast_preview_render and not want_world:
-            LOGGER.info("Using fast preview render; skipping world conversion.")
-        space: GaussianSpace = "world" if want_world else "pred"
+        if fast_preview_render and not want_world_for_predict:
+            if effective_save_ply:
+                LOGGER.info("Using fast preview render; deferring world conversion for export.")
+            else:
+                LOGGER.info("Using fast preview render; skipping world conversion.")
+        space: GaussianSpace = "world" if want_world_for_predict else "pred"
         LOGGER.info("Computing world-space gaussians: %s", "yes" if space == "world" else "no")
 
         predict_start = perf_counter()
@@ -346,31 +375,11 @@ def predict_cli(
             amp_enabled=amp,
             amp_dtype=amp_autocast_dtype,
             metrics=metrics,
-            return_world=want_world,
+            return_world=want_world_for_predict,
             return_unprojection=fast_preview_render,
+            return_unprojection_context=fast_preview_render or effective_save_ply,
         )
         metrics.add_time("predict_total", perf_counter() - predict_start)
-
-        if effective_save_ply:
-            LOGGER.info("Saving 3DGS to %s", output_path)
-            if prediction.world is None:
-                raise click.ClickException(
-                    "World-space Gaussians missing; cannot export PLY without conversion."
-                )
-            save_ply(
-                prediction.world,
-                f_px,
-                (height, width),
-                out_dir / f"{image_path.stem}.ply",
-                metrics=metrics,
-            )
-        else:
-            if save_ply is None and want_sbs_image:
-                LOGGER.info(
-                    "Skipping .ply save because --sbs-image was requested (use --save-ply to override)."
-                )
-            else:
-                LOGGER.info("Skipping .ply save because --no-save-ply was requested.")
 
         # Determine SBS image output path (optional)
         sbs_image_path: Path | None = None
@@ -475,6 +484,41 @@ def predict_cli(
                     metrics=metrics,
                 )
             metrics.add_time("render_total", perf_counter() - render_start)
+
+        if effective_save_ply:
+            world_gaussians = prediction.world
+            if world_gaussians is None:
+                LOGGER.info("Export requested: computing world-space gaussians for PLY.")
+                if prediction.unprojection_context is None:
+                    raise click.ClickException(
+                        "World-space Gaussians missing; cannot export PLY without conversion."
+                    )
+                export_start = perf_counter()
+                world_gaussians = _compute_world_gaussians_for_export(
+                    prediction,
+                    metrics=metrics,
+                    export_fp32=export_fp32,
+                )
+                metrics.add_time("export_world_convert", perf_counter() - export_start)
+                _log_export_fallbacks(metrics)
+            else:
+                LOGGER.info("Export requested: using cached world-space gaussians for PLY.")
+            LOGGER.info("Saving 3DGS to %s", output_path)
+            save_ply(
+                world_gaussians,
+                f_px,
+                (height, width),
+                out_dir / f"{image_path.stem}.ply",
+                metrics=metrics,
+            )
+            LOGGER.info("Export complete.")
+        else:
+            if save_ply is None and want_sbs_image:
+                LOGGER.info(
+                    "Skipping .ply save because --sbs-image was requested (use --save-ply to override)."
+                )
+            else:
+                LOGGER.info("Skipping .ply save because --no-save-ply was requested.")
         metrics.add_time("per_image_total", perf_counter() - image_start)
     metrics.add_time("run_total", perf_counter() - run_start)
     _log_metrics_summary(metrics)
@@ -490,6 +534,7 @@ def predict_image(
     metrics: Metrics | None = None,
     return_world: bool = True,
     return_unprojection: bool = False,
+    return_unprojection_context: bool = False,
 ) -> PredictionResult:
     """Predict Gaussians from an image."""
     internal_shape = (1536, 1536)
@@ -559,7 +604,8 @@ def predict_image(
 
     gaussians_world = None
     unprojection_matrix = None
-    if return_world or return_unprojection:
+    unprojection_context = None
+    if return_world or return_unprojection or return_unprojection_context:
         intrinsics = (
             torch.tensor(
                 [
@@ -575,9 +621,15 @@ def predict_image(
         intrinsics_resized = intrinsics.clone()
         intrinsics_resized[0] *= internal_shape[0] / width
         intrinsics_resized[1] *= internal_shape[1] / height
-        unprojection_matrix = get_unprojection_matrix(
-            torch.eye(4).to(device), intrinsics_resized, internal_shape
+        unprojection_context = UnprojectionContext(
+            intrinsics_resized=intrinsics_resized,
+            internal_shape=internal_shape,
+            device=device,
         )
+        if return_unprojection:
+            unprojection_matrix = get_unprojection_matrix(
+                torch.eye(4).to(device), intrinsics_resized, internal_shape
+            )
         if return_world:
             # Convert Gaussians to metrics space.
             gaussians_world = unproject_gaussians(
@@ -594,7 +646,61 @@ def predict_image(
         pred=gaussians_ndc,
         world=gaussians_world,
         unprojection_matrix=unprojection_matrix,
+        unprojection_context=unprojection_context,
     )
+
+
+def _cast_gaussians(gaussians: Gaussians3D, dtype: torch.dtype) -> Gaussians3D:
+    return Gaussians3D(
+        mean_vectors=gaussians.mean_vectors.to(dtype=dtype),
+        singular_values=gaussians.singular_values.to(dtype=dtype),
+        quaternions=gaussians.quaternions.to(dtype=dtype),
+        colors=gaussians.colors.to(dtype=dtype),
+        opacities=gaussians.opacities.to(dtype=dtype),
+    )
+
+
+def _compute_world_gaussians_for_export(
+    prediction: PredictionResult,
+    metrics: Metrics | None,
+    export_fp32: bool,
+) -> Gaussians3D:
+    context = prediction.unprojection_context
+    if context is None:
+        raise click.ClickException("Missing unprojection context for export conversion.")
+    pred_gaussians = prediction.pred
+    if export_fp32:
+        pred_gaussians = _cast_gaussians(pred_gaussians, torch.float32)
+    extrinsics = torch.eye(4, device=context.device, dtype=context.intrinsics_resized.dtype)
+    if context.device.type == "cuda":
+        with torch.autocast(device_type="cuda", enabled=False):
+            return unproject_gaussians(
+                pred_gaussians,
+                extrinsics,
+                context.intrinsics_resized,
+                context.internal_shape,
+                metrics=metrics,
+            )
+    return unproject_gaussians(
+        pred_gaussians,
+        extrinsics,
+        context.intrinsics_resized,
+        context.internal_shape,
+        metrics=metrics,
+    )
+
+
+def _log_export_fallbacks(metrics: Metrics | None) -> None:
+    if metrics is None:
+        return
+    cov_nonfinite = metrics.counters.get("cov_nonfinite", 0)
+    cpu_fallbacks = metrics.counters.get("eigh_cpu_fallback", 0)
+    if cov_nonfinite > 0 or cpu_fallbacks > 0:
+        LOGGER.warning(
+            "Export covariance fallbacks: cov_nonfinite=%d eigh_cpu_fallback=%d",
+            cov_nonfinite,
+            cpu_fallbacks,
+        )
 
 
 def _log_metrics_summary(metrics: Metrics) -> None:
@@ -612,6 +718,7 @@ def _log_metrics_summary(metrics: Metrics) -> None:
         "decompose_covariance",
         "predict_total",
         "render_total",
+        "export_world_convert",
         "save_ply",
         "per_image_total",
         "run_total",
