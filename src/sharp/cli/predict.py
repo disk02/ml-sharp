@@ -28,12 +28,16 @@ from sharp.utils import logging as logging_utils
 from sharp.utils.gaussians import (
     Gaussians3D,
     SceneMetaData,
+    get_unprojection_matrix,
     save_ply,
     unproject_gaussians,
 )
 from sharp.utils.metrics import Metrics
 
-from sharp.rendering.gaussian_renderer import render_gaussians
+from sharp.rendering.gaussian_renderer import (
+    render_gaussians,
+    render_gaussians_pred_space,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -45,6 +49,7 @@ GaussianSpace = Literal["pred", "world"]
 class PredictionResult:
     pred: Gaussians3D
     world: Gaussians3D | None = None
+    unprojection_matrix: torch.Tensor | None = None
 
 
 @click.command()
@@ -97,6 +102,12 @@ class PredictionResult:
     help="Which frame index to save for --sbs-image.",
 )
 @click.option(
+    "--fast-preview-render",
+    is_flag=True,
+    default=False,
+    help="Render SBS preview using predicted-space gaussians (skips world conversion).",
+)
+@click.option(
     "--save-ply/--no-save-ply",
     default=None,
     show_default=False,
@@ -136,6 +147,7 @@ def predict_cli(
     with_rendering: bool,
     sbs_image: Path | None,
     sbs_image_frame: int,
+    fast_preview_render: bool,
     save_ply: bool | None,
     skip_world_conversion: bool,
     device: str,
@@ -218,6 +230,13 @@ def predict_cli(
 
     want_sbs_image = sbs_image is not None
     want_video = with_rendering
+    if fast_preview_render and not want_sbs_image:
+        LOGGER.warning("--fast-preview-render is only used with --sbs-image. Disabling.")
+        fast_preview_render = False
+    if fast_preview_render and want_video:
+        raise click.ClickException(
+            "--fast-preview-render is only supported for --sbs-image (not --render)."
+        )
     if save_ply is None and want_sbs_image:
         effective_save_ply = False
     elif save_ply is None and not want_sbs_image:
@@ -246,7 +265,7 @@ def predict_cli(
             device=device,
             dtype=torch.float32,
         )
-        want_world = effective_save_ply or want_video or want_sbs_image
+        want_world = effective_save_ply or want_video or (want_sbs_image and not fast_preview_render)
         if skip_world_conversion and want_world:
             raise click.ClickException(
                 "World-space conversion is required for rendering or PLY export. "
@@ -254,6 +273,8 @@ def predict_cli(
             )
         if skip_world_conversion:
             LOGGER.info("Skipping world conversion (unproject/apply_transform).")
+        if fast_preview_render and not want_world:
+            LOGGER.info("Using fast preview render; skipping world conversion.")
         space: GaussianSpace = "world" if want_world else "pred"
         LOGGER.info("Computing world-space gaussians: %s", "yes" if space == "world" else "no")
 
@@ -267,6 +288,7 @@ def predict_cli(
             amp_dtype=amp_autocast_dtype,
             metrics=metrics,
             return_world=want_world,
+            return_unprojection=fast_preview_render,
         )
         metrics.add_time("predict_total", perf_counter() - predict_start)
 
@@ -326,21 +348,36 @@ def predict_cli(
                 # Placeholder path; render_gaussians will not write video when sbs_image_path is set.
                 output_video_path = (out_dir / image_path.stem).with_suffix(".mp4")
 
-            if prediction.world is None:
-                raise click.ClickException(
-                    "World-space Gaussians missing; rendering requires world conversion."
-                )
             metadata = SceneMetaData(intrinsics[0, 0].item(), (width, height), "linearRGB")
 
             render_start = perf_counter()
-            render_gaussians(
-                gaussians=prediction.world,
-                metadata=metadata,
-                output_path=output_video_path,
-                sbs_image_path=sbs_image_path,
-                sbs_image_frame=sbs_image_frame,
-                metrics=metrics,
-            )
+            if fast_preview_render:
+                if prediction.unprojection_matrix is None:
+                    raise click.ClickException(
+                        "Missing unprojection matrix for fast preview rendering."
+                    )
+                render_gaussians_pred_space(
+                    gaussians=prediction.pred,
+                    metadata=metadata,
+                    output_path=output_video_path,
+                    unprojection_matrix=prediction.unprojection_matrix,
+                    sbs_image_path=sbs_image_path,
+                    sbs_image_frame=sbs_image_frame,
+                    metrics=metrics,
+                )
+            else:
+                if prediction.world is None:
+                    raise click.ClickException(
+                        "World-space Gaussians missing; rendering requires world conversion."
+                    )
+                render_gaussians(
+                    gaussians=prediction.world,
+                    metadata=metadata,
+                    output_path=output_video_path,
+                    sbs_image_path=sbs_image_path,
+                    sbs_image_frame=sbs_image_frame,
+                    metrics=metrics,
+                )
             metrics.add_time("render_total", perf_counter() - render_start)
         metrics.add_time("per_image_total", perf_counter() - image_start)
     metrics.add_time("run_total", perf_counter() - run_start)
@@ -356,6 +393,7 @@ def predict_image(
     amp_dtype: torch.dtype,
     metrics: Metrics | None = None,
     return_world: bool = True,
+    return_unprojection: bool = False,
 ) -> PredictionResult:
     """Predict Gaussians from an image."""
     internal_shape = (1536, 1536)
@@ -424,7 +462,8 @@ def predict_image(
     )
 
     gaussians_world = None
-    if return_world:
+    unprojection_matrix = None
+    if return_world or return_unprojection:
         intrinsics = (
             torch.tensor(
                 [
@@ -440,19 +479,26 @@ def predict_image(
         intrinsics_resized = intrinsics.clone()
         intrinsics_resized[0] *= internal_shape[0] / width
         intrinsics_resized[1] *= internal_shape[1] / height
-
-        # Convert Gaussians to metrics space.
-        gaussians_world = unproject_gaussians(
-            gaussians_ndc,
-            torch.eye(4).to(device),
-            intrinsics_resized,
-            internal_shape,
-            metrics=metrics,
+        unprojection_matrix = get_unprojection_matrix(
+            torch.eye(4).to(device), intrinsics_resized, internal_shape
         )
+        if return_world:
+            # Convert Gaussians to metrics space.
+            gaussians_world = unproject_gaussians(
+                gaussians_ndc,
+                torch.eye(4).to(device),
+                intrinsics_resized,
+                internal_shape,
+                metrics=metrics,
+            )
     if metrics and postprocess_start is not None:
         metrics.add_time("postprocess", perf_counter() - postprocess_start)
 
-    return PredictionResult(pred=gaussians_ndc, world=gaussians_world)
+    return PredictionResult(
+        pred=gaussians_ndc,
+        world=gaussians_world,
+        unprojection_matrix=unprojection_matrix,
+    )
 
 
 def _log_metrics_summary(metrics: Metrics) -> None:
