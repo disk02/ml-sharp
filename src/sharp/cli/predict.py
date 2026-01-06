@@ -68,15 +68,15 @@ DEFAULT_MODEL_URL = "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh
 )
 @click.option(
     "--sbs-image",
-    type=click.Path(path_type=Path),
-    default=None,
-    flag_value="__AUTO__",
-    show_default=False,
-    help=(
-        "Optional path to save a single SBS frame image (PNG/JPG). "
-        "If provided without a value, saves to <output-path>/<image_stem>_sbs.png. "
-        "If a directory path is provided, saves <dir>/<image_stem>_sbs.png."
-    ),
+    is_flag=True,
+    default=False,
+    help="Save a side-by-side stereo image from the prediction output.",
+)
+@click.option(
+    "--align-stereo",
+    is_flag=True,
+    default=False,
+    help="Align and crop stereo pair before composing SBS (only with --sbs-image).",
 )
 @click.option(
     "--sbs-image-frame",
@@ -103,7 +103,8 @@ def predict_cli(
     output_path: Path,
     checkpoint_path: Path,
     with_rendering: bool,
-    sbs_image: Path | None,
+    sbs_image: bool,
+    align_stereo: bool,
     sbs_image_frame: int,
     save_ply: bool | None,
     device: str,
@@ -161,7 +162,7 @@ def predict_cli(
 
     output_path.mkdir(exist_ok=True, parents=True)
 
-    want_sbs_image = sbs_image is not None
+    want_sbs_image = sbs_image
     want_video = with_rendering
     if save_ply is None and want_sbs_image:
         effective_save_ply = False
@@ -169,6 +170,9 @@ def predict_cli(
         effective_save_ply = True
     else:
         effective_save_ply = bool(save_ply)
+
+    if align_stereo and not want_sbs_image:
+        LOGGER.warning("Ignoring --align-stereo because --sbs-image is not enabled.")
 
     for index, image_path in enumerate(image_paths, start=1):
         rel_path = image_path.relative_to(input_path) if input_is_dir else Path(image_path.name)
@@ -203,29 +207,11 @@ def predict_cli(
         # Determine SBS image output path (optional)
         sbs_image_path: Path | None = None
         if want_sbs_image:
-            sbs_out = Path(sbs_image)
-            # Support `--sbs-image` with no value: default to output directory
-            if sbs_out.name == "__AUTO__":
-                sbs_image_path = out_dir / f"{image_path.stem}_sbs.png"
-            else:
-                # If a directory path is provided (no suffix), place an image per input
-                if sbs_out.suffix == "":
-                    sbs_base = sbs_out
-                    if input_is_dir:
-                        sbs_base = sbs_out / rel_path.parent
-                        sbs_base.mkdir(parents=True, exist_ok=True)
-                    sbs_image_path = sbs_base / f"{image_path.stem}_sbs.png"
-                else:
-                    # If multiple inputs are processed and a single file path is given, avoid overwrites
-                    if len(image_paths) > 1:
-                        rel_stem = "_".join(rel_path.with_suffix("").parts)
-                        sbs_image_path = sbs_out.with_name(
-                            f"{sbs_out.stem}_{rel_stem}{sbs_out.suffix}"
-                        )
-                    else:
-                        sbs_image_path = sbs_out
-            if sbs_image_path is not None:
-                sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
+            sbs_filename = "sbs.png"
+            if len(image_paths) > 1:
+                sbs_filename = f"{image_path.stem}_sbs.png"
+            sbs_image_path = out_dir / sbs_filename
+            sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
 
         if want_video or sbs_image_path is not None:
             if want_video:
@@ -243,6 +229,7 @@ def predict_cli(
                 output_path=output_video_path,
                 sbs_image_path=sbs_image_path,
                 sbs_image_frame=sbs_image_frame,
+                align_stereo=align_stereo,
             )
 
 
