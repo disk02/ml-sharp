@@ -6,6 +6,7 @@ Copyright (C) 2025 Apple Inc. All Rights Reserved.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import NamedTuple
 
@@ -16,6 +17,8 @@ from torch import nn
 from sharp.utils import color_space as cs_utils
 from sharp.utils import io, vis
 from sharp.utils.gaussians import BackgroundColor, Gaussians3D
+
+LOGGER = logging.getLogger(__name__)
 
 
 class RenderingOutputs(NamedTuple):
@@ -146,6 +149,133 @@ class GSplatRenderer(nn.Module):
             color=torch.cat([item.color for item in outputs_list], dim=0).contiguous(),
             depth=torch.cat([item.depth for item in outputs_list], dim=0).contiguous(),
             alpha=torch.cat([item.alpha for item in outputs_list], dim=0).contiguous(),
+        )
+
+    def render_views(
+        self,
+        gaussians: Gaussians3D,
+        extrinsics: torch.Tensor,
+        intrinsics: torch.Tensor,
+        image_width: int,
+        image_height: int,
+    ) -> RenderingOutputs:
+        """Render multiple camera views of a single Gaussian scene.
+
+        Args:
+            gaussians: The Gaussians to render (unbatched or batch size 1).
+            extrinsics: Camera extrinsics with shape (C, 4, 4).
+            intrinsics: Camera intrinsics with shape (C, 4, 4) or (C, 3, 3).
+            image_width: The desired output image width.
+            image_height: The desired output image height.
+        """
+
+        def _squeeze_scene(tensor: torch.Tensor, name: str) -> torch.Tensor:
+            if tensor.ndim == 3:
+                if tensor.shape[0] != 1:
+                    raise ValueError(f"Expected {name} batch size 1, got {tensor.shape[0]}.")
+                return tensor[0]
+            return tensor
+
+        means = _squeeze_scene(gaussians.mean_vectors, "mean_vectors")
+        quats = _squeeze_scene(gaussians.quaternions, "quaternions")
+        scales = _squeeze_scene(gaussians.singular_values, "singular_values")
+        colors = _squeeze_scene(gaussians.colors, "colors")
+        opacities = _squeeze_scene(gaussians.opacities, "opacities")
+        if opacities.ndim == 2 and opacities.shape[-1] == 1:
+            opacities = opacities.squeeze(-1)
+        if opacities.ndim != 1:
+            raise ValueError("Expected opacities with shape (N,) after squeezing.")
+
+        if intrinsics.ndim != 3:
+            raise ValueError("Expected intrinsics with shape (C, 4, 4) or (C, 3, 3).")
+        if intrinsics.shape[-2:] == (4, 4):
+            Ks = intrinsics[:, :3, :3]
+        elif intrinsics.shape[-2:] == (3, 3):
+            Ks = intrinsics
+        else:
+            raise ValueError("Expected intrinsics with shape (C, 4, 4) or (C, 3, 3).")
+
+        try:
+            colors_out, alphas_out, meta = gsplat.rendering.rasterization(
+                means=means,
+                quats=quats,
+                scales=scales,
+                opacities=opacities,
+                colors=colors,
+                viewmats=extrinsics,
+                Ks=Ks,
+                width=image_width,
+                height=image_height,
+                render_mode="RGB+D",
+                rasterize_mode="classic",
+                absgrad=False,
+                packed=False,
+                eps2d=self.low_pass_filter_eps,
+            )
+        except Exception:
+            LOGGER.warning(
+                "Batched gsplat rasterization failed; falling back to per-view rendering.",
+                exc_info=True,
+            )
+            fallback_outputs: list[RenderingOutputs] = []
+            if gaussians.mean_vectors.ndim == 2:
+                gaussians = Gaussians3D(
+                    mean_vectors=gaussians.mean_vectors.unsqueeze(0),
+                    singular_values=gaussians.singular_values.unsqueeze(0),
+                    quaternions=gaussians.quaternions.unsqueeze(0),
+                    colors=gaussians.colors.unsqueeze(0),
+                    opacities=gaussians.opacities.unsqueeze(0),
+                )
+            for ic in range(extrinsics.shape[0]):
+                extrinsics_view = extrinsics[ic : ic + 1]
+                intrinsics_view = intrinsics[ic : ic + 1]
+                fallback_outputs.append(
+                    self.forward(
+                        gaussians=gaussians,
+                        extrinsics=extrinsics_view,
+                        intrinsics=intrinsics_view,
+                        image_width=image_width,
+                        image_height=image_height,
+                    )
+                )
+            return RenderingOutputs(
+                color=torch.cat([item.color for item in fallback_outputs], dim=0).contiguous(),
+                depth=torch.cat([item.depth for item in fallback_outputs], dim=0).contiguous(),
+                alpha=torch.cat([item.alpha for item in fallback_outputs], dim=0).contiguous(),
+            )
+
+        rendered_color = colors_out[..., 0:3].permute([0, 3, 1, 2])
+        rendered_depth_unnormalized = colors_out[..., 3:4].permute([0, 3, 1, 2])
+        rendered_alpha = alphas_out.permute([0, 3, 1, 2])
+
+        # Compose with background color.
+        rendered_color = self.compose_with_background(
+            rendered_color, rendered_alpha, self.background_color
+        )
+
+        # Colorspace conversion.
+        if self.color_space == "sRGB":
+            pass
+        elif self.color_space == "linearRGB":
+            rendered_color = cs_utils.linearRGB2sRGB(rendered_color)
+        else:
+            ValueError("Unsupported ColorSpace type.")
+
+        # splats: (C, N, 10)
+        cov2d = self._conics_to_covars2d(meta["conics"])
+        # Set the cov2d of invisible splats to 1 to avoid nan in condition number calculation..
+        splats_visible_mask = meta["depths"] > 1e-2
+        cov2d[~splats_visible_mask][..., 0, 0] = 1
+        cov2d[~splats_visible_mask][..., 1, 1] = 1
+        cov2d[~splats_visible_mask][..., 0, 1] = 0
+
+        # Normalize the depth by alpha.
+        rendered_depth = rendered_depth_unnormalized / torch.clip(rendered_alpha, min=1e-8)
+
+        return RenderingOutputs(
+            color=rendered_color,
+            depth=rendered_depth,
+            alpha=rendered_alpha,
         )
 
     @staticmethod
