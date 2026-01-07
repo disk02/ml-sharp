@@ -226,21 +226,23 @@ class GSplatRenderer(nn.Module):
                 exc_info=True,
             )
             fallback_outputs: list[RenderingOutputs] = []
-            if gaussians.mean_vectors.ndim == 2:
-                opacities_batched = _normalize_opacities(gaussians.opacities).unsqueeze(0)
-                gaussians = Gaussians3D(
-                    mean_vectors=gaussians.mean_vectors.unsqueeze(0),
-                    singular_values=gaussians.singular_values.unsqueeze(0),
-                    quaternions=gaussians.quaternions.unsqueeze(0),
-                    colors=gaussians.colors.unsqueeze(0),
-                    opacities=opacities_batched,
-                )
+            gaussians_batched = Gaussians3D(
+                mean_vectors=_squeeze_scene(gaussians.mean_vectors, "mean_vectors").unsqueeze(0),
+                singular_values=_squeeze_scene(
+                    gaussians.singular_values, "singular_values"
+                ).unsqueeze(0),
+                quaternions=_squeeze_scene(gaussians.quaternions, "quaternions").unsqueeze(0),
+                colors=_squeeze_scene(gaussians.colors, "colors").unsqueeze(0),
+                opacities=_normalize_opacities(
+                    _squeeze_scene(gaussians.opacities, "opacities")
+                ).unsqueeze(0),
+            )
             for ic in range(extrinsics.shape[0]):
                 extrinsics_view = extrinsics[ic : ic + 1]
                 intrinsics_view = intrinsics[ic : ic + 1]
                 fallback_outputs.append(
                     self.forward(
-                        gaussians=gaussians,
+                        gaussians=gaussians_batched,
                         extrinsics=extrinsics_view,
                         intrinsics=intrinsics_view,
                         image_width=image_width,
