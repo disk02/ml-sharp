@@ -13,6 +13,37 @@ from sharp.utils.gaussians import Gaussians3D, SceneMetaData
 from sharp.utils.metrics import Metrics
 
 
+def _save_sbs_image(
+    sbs_image_path: Path,
+    color_l: torch.Tensor,
+    color_r: torch.Tensor,
+    align_crop: bool,
+) -> None:
+    """Save left/right tensors as an SBS image, with optional alignment/cropping."""
+    color_l_np = color_l.detach().cpu().numpy()
+    color_r_np = color_r.detach().cpu().numpy()
+
+    if align_crop:
+        # Import lazily so OpenCV isn't required unless --align-crop is used.
+        try:
+            from sharp.utils.stereo_align import AlignParams, auto_align_and_crop
+        except ImportError as e:  # pragma: no cover
+            raise RuntimeError(
+                "Stereo auto-alignment requires OpenCV. Install opencv-python "
+                "(or opencv-python-headless), or omit --align-crop."
+            ) from e
+
+        align_params = AlignParams()
+        color_l_np, color_r_np, _meta = auto_align_and_crop(
+            color_l_np, color_r_np, params=align_params
+        )
+
+    color_sbs_np = np.concatenate((color_l_np, color_r_np), axis=1)
+    img = Image.fromarray(color_sbs_np, mode="RGB")
+    sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
+    img.save(sbs_image_path)
+
+
 def render_gaussians(
     gaussians: Gaussians3D,
     metadata: SceneMetaData,
@@ -79,13 +110,13 @@ def render_gaussians(
         eye_position_r[0] += baseline * 0.5
 
         # Left view
-        camera_info = camera_model.compute(eye_position_l)
+        camera_info_l = camera_model.compute(eye_position_l)
         rendering_output = renderer(
             gaussians.to(device),
-            extrinsics=camera_info.extrinsics[None].to(device),
-            intrinsics=camera_info.intrinsics[None].to(device),
-            image_width=camera_info.width,
-            image_height=camera_info.height,
+            extrinsics=camera_info_l.extrinsics[None].to(device),
+            intrinsics=camera_info_l.intrinsics[None].to(device),
+            image_width=camera_info_l.width,
+            image_height=camera_info_l.height,
         )
         color_l = (rendering_output.color[0].permute(1, 2, 0) * 255.0).to(
             dtype=torch.uint8
@@ -93,13 +124,13 @@ def render_gaussians(
         depth_l = rendering_output.depth[0]
 
         # Right view
-        camera_info = camera_model.compute(eye_position_r)
+        camera_info_r = camera_model.compute(eye_position_r)
         rendering_output = renderer(
             gaussians.to(device),
-            extrinsics=camera_info.extrinsics[None].to(device),
-            intrinsics=camera_info.intrinsics[None].to(device),
-            image_width=camera_info.width,
-            image_height=camera_info.height,
+            extrinsics=camera_info_r.extrinsics[None].to(device),
+            intrinsics=camera_info_r.intrinsics[None].to(device),
+            image_width=camera_info_r.width,
+            image_height=camera_info_r.height,
         )
         color_r = (rendering_output.color[0].permute(1, 2, 0) * 255.0).to(
             dtype=torch.uint8
@@ -111,30 +142,28 @@ def render_gaussians(
 
         # Write SBS frame image if requested
         if sbs_image_path is not None and frame_idx == sbs_image_frame:
-            # Convert torch -> numpy (H,W,3) uint8
-            color_l_np = color_l.detach().cpu().numpy()
-            color_r_np = color_r.detach().cpu().numpy()
-
-            if align_crop:
-                # Import lazily so OpenCV isn't required unless --align-crop is used.
-                try:
-                    from sharp.utils.stereo_align import AlignParams, auto_align_and_crop
-                except ImportError as e:  # pragma: no cover
-                    raise RuntimeError(
-                        "Stereo auto-alignment requires OpenCV. Install opencv-python "
-                        "(or opencv-python-headless), or omit --align-crop."
-                    ) from e
-
-                # Auto-align + auto-crop the stereo pair, then re-pack SBS for output.
-                align_params = AlignParams()
-                color_l_np, color_r_np, _meta = auto_align_and_crop(
-                    color_l_np, color_r_np, params=align_params
-                )
-
-            color_sbs_np = np.concatenate((color_l_np, color_r_np), axis=1)
-            img = Image.fromarray(color_sbs_np, mode="RGB")
-            sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
-            img.save(sbs_image_path)
+            # Phase 2: render both eyes in one gsplat call for SBS image output.
+            gaussians_gpu = gaussians.to(device)
+            extrinsics_views = torch.stack(
+                [camera_info_l.extrinsics, camera_info_r.extrinsics], dim=0
+            ).to(device)
+            intrinsics_views = torch.stack(
+                [camera_info_l.intrinsics, camera_info_r.intrinsics], dim=0
+            ).to(device)
+            rendering_sbs = renderer.render_views(
+                gaussians=gaussians_gpu,
+                extrinsics=extrinsics_views,
+                intrinsics=intrinsics_views,
+                image_width=camera_info_l.width,
+                image_height=camera_info_l.height,
+            )
+            color_l = (rendering_sbs.color[0].permute(1, 2, 0) * 255.0).to(
+                dtype=torch.uint8
+            )
+            color_r = (rendering_sbs.color[1].permute(1, 2, 0) * 255.0).to(
+                dtype=torch.uint8
+            )
+            _save_sbs_image(sbs_image_path, color_l, color_r, align_crop)
             break
 
         # Only add to video if video writer was created
@@ -233,28 +262,28 @@ def render_gaussians_pred_space(
         eye_position_r = eye_mid.clone()
         eye_position_r[0] += baseline * 0.5
 
-        camera_info = camera_model.compute(eye_position_l)
-        extrinsics_l = camera_info.extrinsics.to(device) @ u_pred_to_world
+        camera_info_l = camera_model.compute(eye_position_l)
+        extrinsics_l = camera_info_l.extrinsics.to(device) @ u_pred_to_world
         rendering_output = renderer(
             gaussians.to(device),
             extrinsics=extrinsics_l[None],
-            intrinsics=camera_info.intrinsics[None].to(device),
-            image_width=camera_info.width,
-            image_height=camera_info.height,
+            intrinsics=camera_info_l.intrinsics[None].to(device),
+            image_width=camera_info_l.width,
+            image_height=camera_info_l.height,
         )
         color_l = (rendering_output.color[0].permute(1, 2, 0) * 255.0).to(
             dtype=torch.uint8
         )
         depth_l = rendering_output.depth[0]
 
-        camera_info = camera_model.compute(eye_position_r)
-        extrinsics_r = camera_info.extrinsics.to(device) @ u_pred_to_world
+        camera_info_r = camera_model.compute(eye_position_r)
+        extrinsics_r = camera_info_r.extrinsics.to(device) @ u_pred_to_world
         rendering_output = renderer(
             gaussians.to(device),
             extrinsics=extrinsics_r[None],
-            intrinsics=camera_info.intrinsics[None].to(device),
-            image_width=camera_info.width,
-            image_height=camera_info.height,
+            intrinsics=camera_info_r.intrinsics[None].to(device),
+            image_width=camera_info_r.width,
+            image_height=camera_info_r.height,
         )
         color_r = (rendering_output.color[0].permute(1, 2, 0) * 255.0).to(
             dtype=torch.uint8
@@ -264,27 +293,26 @@ def render_gaussians_pred_space(
         color = torch.cat((color_l, color_r), dim=1)
 
         if sbs_image_path is not None and frame_idx == sbs_image_frame:
-            color_l_np = color_l.detach().cpu().numpy()
-            color_r_np = color_r.detach().cpu().numpy()
-
-            if align_crop:
-                try:
-                    from sharp.utils.stereo_align import AlignParams, auto_align_and_crop
-                except ImportError as e:  # pragma: no cover
-                    raise RuntimeError(
-                        "Stereo auto-alignment requires OpenCV. Install opencv-python "
-                        "(or opencv-python-headless), or omit --align-crop."
-                    ) from e
-
-                align_params = AlignParams()
-                color_l_np, color_r_np, _meta = auto_align_and_crop(
-                    color_l_np, color_r_np, params=align_params
-                )
-
-            color_sbs_np = np.concatenate((color_l_np, color_r_np), axis=1)
-            img = Image.fromarray(color_sbs_np, mode="RGB")
-            sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
-            img.save(sbs_image_path)
+            # Phase 2: render both eyes in one gsplat call for SBS image output.
+            gaussians_gpu = gaussians.to(device)
+            extrinsics_views = torch.stack([extrinsics_l, extrinsics_r], dim=0)
+            intrinsics_views = torch.stack(
+                [camera_info_l.intrinsics, camera_info_r.intrinsics], dim=0
+            ).to(device)
+            rendering_sbs = renderer.render_views(
+                gaussians=gaussians_gpu,
+                extrinsics=extrinsics_views,
+                intrinsics=intrinsics_views,
+                image_width=camera_info_l.width,
+                image_height=camera_info_l.height,
+            )
+            color_l = (rendering_sbs.color[0].permute(1, 2, 0) * 255.0).to(
+                dtype=torch.uint8
+            )
+            color_r = (rendering_sbs.color[1].permute(1, 2, 0) * 255.0).to(
+                dtype=torch.uint8
+            )
+            _save_sbs_image(sbs_image_path, color_l, color_r, align_crop)
             break
 
         if video_writer is not None:
