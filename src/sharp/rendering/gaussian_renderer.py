@@ -20,6 +20,7 @@ def render_gaussians(
     params: camera.TrajectoryParams | None = None,
     sbs_image_path: Path | None = None,
     sbs_image_frame: int = 0,
+    align_crop: bool = False,
     metrics: Metrics | None = None,
 ) -> None:
     """Render a single gaussian checkpoint file."""
@@ -110,26 +111,27 @@ def render_gaussians(
 
         # Write SBS frame image if requested
         if sbs_image_path is not None and frame_idx == sbs_image_frame:
-            # Import lazily so OpenCV isn't required unless --sbs-image is used.
-            try:
-                from sharp.utils.stereo_align import AlignParams, auto_align_and_crop
-            except ImportError as e:  # pragma: no cover
-                raise RuntimeError(
-                    "Stereo auto-alignment requires OpenCV. Install opencv-python "
-                    "(or opencv-python-headless)."
-                ) from e
-
             # Convert torch -> numpy (H,W,3) uint8
             color_l_np = color_l.detach().cpu().numpy()
             color_r_np = color_r.detach().cpu().numpy()
 
-            # Auto-align + auto-crop the stereo pair, then re-pack SBS for output.
-            align_params = AlignParams()
-            color_l_aligned, color_r_aligned, _meta = auto_align_and_crop(
-                color_l_np, color_r_np, params=align_params
-            )
+            if align_crop:
+                # Import lazily so OpenCV isn't required unless --align-crop is used.
+                try:
+                    from sharp.utils.stereo_align import AlignParams, auto_align_and_crop
+                except ImportError as e:  # pragma: no cover
+                    raise RuntimeError(
+                        "Stereo auto-alignment requires OpenCV. Install opencv-python "
+                        "(or opencv-python-headless), or omit --align-crop."
+                    ) from e
 
-            color_sbs_np = np.concatenate((color_l_aligned, color_r_aligned), axis=1)
+                # Auto-align + auto-crop the stereo pair, then re-pack SBS for output.
+                align_params = AlignParams()
+                color_l_np, color_r_np, _meta = auto_align_and_crop(
+                    color_l_np, color_r_np, params=align_params
+                )
+
+            color_sbs_np = np.concatenate((color_l_np, color_r_np), axis=1)
             img = Image.fromarray(color_sbs_np, mode="RGB")
             sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
             img.save(sbs_image_path)
@@ -153,6 +155,7 @@ def render_gaussians_pred_space(
     params: camera.TrajectoryParams | None = None,
     sbs_image_path: Path | None = None,
     sbs_image_frame: int = 0,
+    align_crop: bool = False,
     metrics: Metrics | None = None,
 ) -> None:
     """Render predicted-space Gaussians by folding unprojection into the camera."""
@@ -261,23 +264,24 @@ def render_gaussians_pred_space(
         color = torch.cat((color_l, color_r), dim=1)
 
         if sbs_image_path is not None and frame_idx == sbs_image_frame:
-            try:
-                from sharp.utils.stereo_align import AlignParams, auto_align_and_crop
-            except ImportError as e:  # pragma: no cover
-                raise RuntimeError(
-                    "Stereo auto-alignment requires OpenCV. Install opencv-python "
-                    "(or opencv-python-headless)."
-                ) from e
-
             color_l_np = color_l.detach().cpu().numpy()
             color_r_np = color_r.detach().cpu().numpy()
 
-            align_params = AlignParams()
-            color_l_aligned, color_r_aligned, _meta = auto_align_and_crop(
-                color_l_np, color_r_np, params=align_params
-            )
+            if align_crop:
+                try:
+                    from sharp.utils.stereo_align import AlignParams, auto_align_and_crop
+                except ImportError as e:  # pragma: no cover
+                    raise RuntimeError(
+                        "Stereo auto-alignment requires OpenCV. Install opencv-python "
+                        "(or opencv-python-headless), or omit --align-crop."
+                    ) from e
 
-            color_sbs_np = np.concatenate((color_l_aligned, color_r_aligned), axis=1)
+                align_params = AlignParams()
+                color_l_np, color_r_np, _meta = auto_align_and_crop(
+                    color_l_np, color_r_np, params=align_params
+                )
+
+            color_sbs_np = np.concatenate((color_l_np, color_r_np), axis=1)
             img = Image.fromarray(color_sbs_np, mode="RGB")
             sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
             img.save(sbs_image_path)
