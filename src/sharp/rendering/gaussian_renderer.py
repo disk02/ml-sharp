@@ -20,6 +20,14 @@ def _save_sbs_image(
     align_crop: bool,
 ) -> None:
     """Save left/right tensors as an SBS image, with optional alignment/cropping."""
+    assert color_l.dtype == torch.uint8, "Expected left image tensor dtype uint8."
+    assert color_r.dtype == torch.uint8, "Expected right image tensor dtype uint8."
+    assert (
+        color_l.ndim == 3 and color_l.shape[-1] == 3
+    ), "Expected left image in HWC RGB format."
+    assert (
+        color_r.ndim == 3 and color_r.shape[-1] == 3
+    ), "Expected right image in HWC RGB format."
     color_l_np = color_l.detach().cpu().numpy()
     color_r_np = color_r.detach().cpu().numpy()
 
@@ -96,6 +104,7 @@ def render_gaussians(
         gaussians, params, resolution_px=metadata.resolution_px, f_px=f_px
     )
     renderer = gsplat.GSplatRenderer(color_space=metadata.color_space)
+    gaussians_gpu = gaussians.to(device)
 
     # If only rendering SBS image, don't create video writer
     video_writer = io.VideoWriter(output_path) if sbs_image_path is None else None
@@ -111,39 +120,10 @@ def render_gaussians(
 
         # Left view
         camera_info_l = camera_model.compute(eye_position_l)
-        rendering_output = renderer(
-            gaussians.to(device),
-            extrinsics=camera_info_l.extrinsics[None].to(device),
-            intrinsics=camera_info_l.intrinsics[None].to(device),
-            image_width=camera_info_l.width,
-            image_height=camera_info_l.height,
-        )
-        color_l = (rendering_output.color[0].permute(1, 2, 0) * 255.0).to(
-            dtype=torch.uint8
-        )
-        depth_l = rendering_output.depth[0]
-
-        # Right view
         camera_info_r = camera_model.compute(eye_position_r)
-        rendering_output = renderer(
-            gaussians.to(device),
-            extrinsics=camera_info_r.extrinsics[None].to(device),
-            intrinsics=camera_info_r.intrinsics[None].to(device),
-            image_width=camera_info_r.width,
-            image_height=camera_info_r.height,
-        )
-        color_r = (rendering_output.color[0].permute(1, 2, 0) * 255.0).to(
-            dtype=torch.uint8
-        )
-        depth_r = rendering_output.depth[0]
 
-        # Pack the left and right views into SBS format.
-        color = torch.cat((color_l, color_r), dim=1)
-
-        # Write SBS frame image if requested
+        # Write SBS frame image if requested (Phase 2 batched rendering path).
         if sbs_image_path is not None and frame_idx == sbs_image_frame:
-            # Phase 2: render both eyes in one gsplat call for SBS image output.
-            gaussians_gpu = gaussians.to(device)
             extrinsics_views = torch.stack(
                 [camera_info_l.extrinsics, camera_info_r.extrinsics], dim=0
             ).to(device)
@@ -165,6 +145,33 @@ def render_gaussians(
             )
             _save_sbs_image(sbs_image_path, color_l, color_r, align_crop)
             break
+
+        rendering_output = renderer(
+            gaussians_gpu,
+            extrinsics=camera_info_l.extrinsics[None].to(device),
+            intrinsics=camera_info_l.intrinsics[None].to(device),
+            image_width=camera_info_l.width,
+            image_height=camera_info_l.height,
+        )
+        color_l = (rendering_output.color[0].permute(1, 2, 0) * 255.0).to(
+            dtype=torch.uint8
+        )
+        depth_l = rendering_output.depth[0]
+
+        rendering_output = renderer(
+            gaussians_gpu,
+            extrinsics=camera_info_r.extrinsics[None].to(device),
+            intrinsics=camera_info_r.intrinsics[None].to(device),
+            image_width=camera_info_r.width,
+            image_height=camera_info_r.height,
+        )
+        color_r = (rendering_output.color[0].permute(1, 2, 0) * 255.0).to(
+            dtype=torch.uint8
+        )
+        depth_r = rendering_output.depth[0]
+
+        # Pack the left and right views into SBS format.
+        color = torch.cat((color_l, color_r), dim=1)
 
         # Only add to video if video writer was created
         if video_writer is not None:
@@ -213,7 +220,7 @@ def render_gaussians_pred_space(
     )
     u_pred_to_world = unprojection_matrix.to(device=device, dtype=torch.float32)
 
-    mean_vectors = gaussians.mean_vectors
+    mean_vectors = gaussians.mean_vectors.to(device)
     if mean_vectors.ndim == 3:
         mean_vectors = mean_vectors[0]
     num_points = int(mean_vectors.shape[0])
@@ -251,6 +258,7 @@ def render_gaussians_pred_space(
         gaussians_camera_sample, params, resolution_px=metadata.resolution_px, f_px=f_px
     )
     renderer = gsplat.GSplatRenderer(color_space=metadata.color_space)
+    gaussians_gpu = gaussians.to(device)
 
     video_writer = io.VideoWriter(output_path) if sbs_image_path is None else None
 
@@ -264,37 +272,11 @@ def render_gaussians_pred_space(
 
         camera_info_l = camera_model.compute(eye_position_l)
         extrinsics_l = camera_info_l.extrinsics.to(device) @ u_pred_to_world
-        rendering_output = renderer(
-            gaussians.to(device),
-            extrinsics=extrinsics_l[None],
-            intrinsics=camera_info_l.intrinsics[None].to(device),
-            image_width=camera_info_l.width,
-            image_height=camera_info_l.height,
-        )
-        color_l = (rendering_output.color[0].permute(1, 2, 0) * 255.0).to(
-            dtype=torch.uint8
-        )
-        depth_l = rendering_output.depth[0]
-
         camera_info_r = camera_model.compute(eye_position_r)
         extrinsics_r = camera_info_r.extrinsics.to(device) @ u_pred_to_world
-        rendering_output = renderer(
-            gaussians.to(device),
-            extrinsics=extrinsics_r[None],
-            intrinsics=camera_info_r.intrinsics[None].to(device),
-            image_width=camera_info_r.width,
-            image_height=camera_info_r.height,
-        )
-        color_r = (rendering_output.color[0].permute(1, 2, 0) * 255.0).to(
-            dtype=torch.uint8
-        )
-        depth_r = rendering_output.depth[0]
-
-        color = torch.cat((color_l, color_r), dim=1)
 
         if sbs_image_path is not None and frame_idx == sbs_image_frame:
             # Phase 2: render both eyes in one gsplat call for SBS image output.
-            gaussians_gpu = gaussians.to(device)
             extrinsics_views = torch.stack([extrinsics_l, extrinsics_r], dim=0)
             intrinsics_views = torch.stack(
                 [camera_info_l.intrinsics, camera_info_r.intrinsics], dim=0
@@ -314,6 +296,32 @@ def render_gaussians_pred_space(
             )
             _save_sbs_image(sbs_image_path, color_l, color_r, align_crop)
             break
+
+        rendering_output = renderer(
+            gaussians_gpu,
+            extrinsics=extrinsics_l[None],
+            intrinsics=camera_info_l.intrinsics[None].to(device),
+            image_width=camera_info_l.width,
+            image_height=camera_info_l.height,
+        )
+        color_l = (rendering_output.color[0].permute(1, 2, 0) * 255.0).to(
+            dtype=torch.uint8
+        )
+        depth_l = rendering_output.depth[0]
+
+        rendering_output = renderer(
+            gaussians_gpu,
+            extrinsics=extrinsics_r[None],
+            intrinsics=camera_info_r.intrinsics[None].to(device),
+            image_width=camera_info_r.width,
+            image_height=camera_info_r.height,
+        )
+        color_r = (rendering_output.color[0].permute(1, 2, 0) * 255.0).to(
+            dtype=torch.uint8
+        )
+        depth_r = rendering_output.depth[0]
+
+        color = torch.cat((color_l, color_r), dim=1)
 
         if video_writer is not None:
             depth = torch.cat((depth_l, depth_r), dim=0)
