@@ -159,6 +159,12 @@ def _align_for_compare(
     help="Render SBS preview using predicted-space gaussians (skips world conversion).",
 )
 @click.option(
+    "--align-crop",
+    is_flag=True,
+    default=False,
+    help="If set, auto-align and auto-crop the SBS stereo pair before saving the SBS image.",
+)
+@click.option(
     "--fast-preview-compare",
     is_flag=True,
     default=False,
@@ -218,6 +224,7 @@ def predict_cli(
     sbs_image: Path | None,
     sbs_image_frame: int,
     fast_preview_render: bool,
+    align_crop: bool,
     fast_preview_compare: bool,
     save_ply: bool | None,
     skip_world_conversion: bool,
@@ -442,6 +449,7 @@ def predict_cli(
                         output_path=output_video_path,
                         sbs_image_path=baseline_path,
                         sbs_image_frame=sbs_image_frame,
+                        align_crop=align_crop,
                         metrics=metrics,
                     )
                 render_gaussians_pred_space(
@@ -451,6 +459,7 @@ def predict_cli(
                     unprojection_matrix=prediction.unprojection_matrix,
                     sbs_image_path=sbs_image_path,
                     sbs_image_frame=sbs_image_frame,
+                    align_crop=align_crop,
                     metrics=metrics,
                 )
                 if fast_preview_compare and sbs_image_path is not None:
@@ -481,6 +490,7 @@ def predict_cli(
                     output_path=output_video_path,
                     sbs_image_path=sbs_image_path,
                     sbs_image_frame=sbs_image_frame,
+                    align_crop=align_crop,
                     metrics=metrics,
                 )
             metrics.add_time("render_total", perf_counter() - render_start)
