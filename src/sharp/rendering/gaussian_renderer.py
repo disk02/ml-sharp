@@ -20,14 +20,26 @@ def _save_sbs_image(
     align_crop: bool,
 ) -> None:
     """Save left/right tensors as an SBS image, with optional alignment/cropping."""
-    assert color_l.dtype == torch.uint8, "Expected left image tensor dtype uint8."
-    assert color_r.dtype == torch.uint8, "Expected right image tensor dtype uint8."
-    assert (
-        color_l.ndim == 3 and color_l.shape[-1] == 3
-    ), "Expected left image in HWC RGB format."
-    assert (
-        color_r.ndim == 3 and color_r.shape[-1] == 3
-    ), "Expected right image in HWC RGB format."
+    if color_l.dtype != torch.uint8:
+        raise ValueError(
+            "Expected left image tensor dtype uint8, "
+            f"got {color_l.dtype} instead."
+        )
+    if color_r.dtype != torch.uint8:
+        raise ValueError(
+            "Expected right image tensor dtype uint8, "
+            f"got {color_r.dtype} instead."
+        )
+    if color_l.ndim != 3 or color_l.shape[-1] != 3:
+        raise ValueError(
+            "Expected left image in HWC RGB format with 3 channels, "
+            f"got shape {tuple(color_l.shape)} instead."
+        )
+    if color_r.ndim != 3 or color_r.shape[-1] != 3:
+        raise ValueError(
+            "Expected right image in HWC RGB format with 3 channels, "
+            f"got shape {tuple(color_r.shape)} instead."
+        )
     color_l_np = color_l.detach().cpu().numpy()
     color_r_np = color_r.detach().cpu().numpy()
 
@@ -125,11 +137,19 @@ def render_gaussians(
         # Write SBS frame image if requested (Phase 2 batched rendering path).
         if sbs_image_path is not None and frame_idx == sbs_image_frame:
             extrinsics_views = torch.stack(
-                [camera_info_l.extrinsics, camera_info_r.extrinsics], dim=0
-            ).to(device)
+                [
+                    camera_info_l.extrinsics.to(device),
+                    camera_info_r.extrinsics.to(device),
+                ],
+                dim=0,
+            )
             intrinsics_views = torch.stack(
-                [camera_info_l.intrinsics, camera_info_r.intrinsics], dim=0
-            ).to(device)
+                [
+                    camera_info_l.intrinsics.to(device),
+                    camera_info_r.intrinsics.to(device),
+                ],
+                dim=0,
+            )
             rendering_sbs = renderer.render_views(
                 gaussians=gaussians_gpu,
                 extrinsics=extrinsics_views,
@@ -274,13 +294,13 @@ def render_gaussians_pred_space(
         extrinsics_l = camera_info_l.extrinsics.to(device) @ u_pred_to_world
         camera_info_r = camera_model.compute(eye_position_r)
         extrinsics_r = camera_info_r.extrinsics.to(device) @ u_pred_to_world
+        intrinsics_l = camera_info_l.intrinsics.to(device)
+        intrinsics_r = camera_info_r.intrinsics.to(device)
 
         if sbs_image_path is not None and frame_idx == sbs_image_frame:
             # Phase 2: render both eyes in one gsplat call for SBS image output.
             extrinsics_views = torch.stack([extrinsics_l, extrinsics_r], dim=0)
-            intrinsics_views = torch.stack(
-                [camera_info_l.intrinsics, camera_info_r.intrinsics], dim=0
-            ).to(device)
+            intrinsics_views = torch.stack([intrinsics_l, intrinsics_r], dim=0)
             rendering_sbs = renderer.render_views(
                 gaussians=gaussians_gpu,
                 extrinsics=extrinsics_views,
@@ -300,7 +320,7 @@ def render_gaussians_pred_space(
         rendering_output = renderer(
             gaussians_gpu,
             extrinsics=extrinsics_l[None],
-            intrinsics=camera_info_l.intrinsics[None].to(device),
+            intrinsics=intrinsics_l[None],
             image_width=camera_info_l.width,
             image_height=camera_info_l.height,
         )
@@ -312,7 +332,7 @@ def render_gaussians_pred_space(
         rendering_output = renderer(
             gaussians_gpu,
             extrinsics=extrinsics_r[None],
-            intrinsics=camera_info_r.intrinsics[None].to(device),
+            intrinsics=intrinsics_r[None],
             image_width=camera_info_r.width,
             image_height=camera_info_r.height,
         )
