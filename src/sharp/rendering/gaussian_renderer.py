@@ -133,23 +133,15 @@ def render_gaussians(
         # Left view
         camera_info_l = camera_model.compute(eye_position_l)
         camera_info_r = camera_model.compute(eye_position_r)
+        extrinsics_l = camera_info_l.extrinsics.to(device)
+        extrinsics_r = camera_info_r.extrinsics.to(device)
+        intrinsics_l = camera_info_l.intrinsics.to(device)
+        intrinsics_r = camera_info_r.intrinsics.to(device)
 
         # Write SBS frame image if requested (Phase 2 batched rendering path).
         if sbs_image_path is not None and frame_idx == sbs_image_frame:
-            extrinsics_views = torch.stack(
-                [
-                    camera_info_l.extrinsics.to(device),
-                    camera_info_r.extrinsics.to(device),
-                ],
-                dim=0,
-            )
-            intrinsics_views = torch.stack(
-                [
-                    camera_info_l.intrinsics.to(device),
-                    camera_info_r.intrinsics.to(device),
-                ],
-                dim=0,
-            )
+            extrinsics_views = torch.stack([extrinsics_l, extrinsics_r], dim=0)
+            intrinsics_views = torch.stack([intrinsics_l, intrinsics_r], dim=0)
             rendering_sbs = renderer.render_views(
                 gaussians=gaussians_gpu,
                 extrinsics=extrinsics_views,
@@ -168,8 +160,8 @@ def render_gaussians(
 
         rendering_output = renderer(
             gaussians_gpu,
-            extrinsics=camera_info_l.extrinsics[None].to(device),
-            intrinsics=camera_info_l.intrinsics[None].to(device),
+            extrinsics=extrinsics_l[None],
+            intrinsics=intrinsics_l[None],
             image_width=camera_info_l.width,
             image_height=camera_info_l.height,
         )
@@ -180,8 +172,8 @@ def render_gaussians(
 
         rendering_output = renderer(
             gaussians_gpu,
-            extrinsics=camera_info_r.extrinsics[None].to(device),
-            intrinsics=camera_info_r.intrinsics[None].to(device),
+            extrinsics=extrinsics_r[None],
+            intrinsics=intrinsics_r[None],
             image_width=camera_info_r.width,
             image_height=camera_info_r.height,
         )
