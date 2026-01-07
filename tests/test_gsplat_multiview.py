@@ -1,11 +1,13 @@
 import pytest
-import torch
+
+torch = pytest.importorskip("torch", reason="PyTorch is required for gsplat tests")
+if not torch.cuda.is_available():
+    pytest.skip("CUDA is required for gsplat multiview test", allow_module_level=True)
 
 from sharp.utils.gaussians import Gaussians3D
 from sharp.utils.gsplat import GSplatRenderer
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for gsplat.")
 def test_gsplat_multiview_batch_rendering() -> None:
     torch.manual_seed(0)
     device = torch.device("cuda")
