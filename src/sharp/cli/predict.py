@@ -594,10 +594,9 @@ def preprocess_one(
     dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor, dict]:
     target_w, target_h = target_size_wh
-    image_pt = (
-        torch.from_numpy(image_np.copy()).to(dtype=dtype, device=device).permute(2, 0, 1)
-        / 255.0
-    )
+    image_np = np.ascontiguousarray(image_np)
+    image_pt = torch.from_numpy(image_np).to(dtype=dtype, device=device).permute(2, 0, 1)
+    image_pt = image_pt / 255.0
     _, height, width = image_pt.shape
     disparity_factor_pt = torch.tensor([f_px / width], dtype=dtype, device=device)
     image_resized_pt = F.interpolate(
@@ -621,6 +620,17 @@ def preprocess_one(
         "target_h": target_h,
     }
     return image_resized_pt, disparity_factor_pt, aux
+
+
+def _slice_gaussians(gaussians: Gaussians3D, idx: int) -> Gaussians3D:
+    """Return a view of a single batch element without copying."""
+    return Gaussians3D(
+        mean_vectors=gaussians.mean_vectors[idx],
+        singular_values=gaussians.singular_values[idx],
+        quaternions=gaussians.quaternions[idx],
+        colors=gaussians.colors[idx],
+        opacities=gaussians.opacities[idx],
+    )
 
 
 def model_forward_batch(
@@ -648,33 +658,62 @@ def postprocess_one(
     return_unprojection: bool,
     device: torch.device,
 ) -> PredictionResult:
-    gaussians_ndc = gaussians_ndc_one
-    quaternions = gaussians_ndc.quaternions
+    need_cast = any(
+        tensor.dtype != torch.float32
+        for tensor in (
+            gaussians_ndc_one.mean_vectors,
+            gaussians_ndc_one.singular_values,
+            gaussians_ndc_one.quaternions,
+            gaussians_ndc_one.colors,
+            gaussians_ndc_one.opacities,
+        )
+    )
+    if need_cast:
+        mean_vectors = gaussians_ndc_one.mean_vectors.float()
+        singular_values = gaussians_ndc_one.singular_values.float()
+        quaternions = gaussians_ndc_one.quaternions.float()
+        colors = gaussians_ndc_one.colors.float()
+        opacities = gaussians_ndc_one.opacities.float()
+    else:
+        mean_vectors = gaussians_ndc_one.mean_vectors
+        singular_values = gaussians_ndc_one.singular_values
+        quaternions = gaussians_ndc_one.quaternions
+        colors = gaussians_ndc_one.colors
+        opacities = gaussians_ndc_one.opacities
     quat_norm = quaternions.norm(dim=-1, keepdim=True)
-    quat_valid = torch.isfinite(quat_norm) & (quat_norm > 1e-8)
-    identity_quat = torch.tensor(
-        [0.0, 0.0, 0.0, 1.0], device=quaternions.device, dtype=quaternions.dtype
-    )
-    quaternions = torch.where(
-        quat_valid, quaternions / quat_norm.clamp_min(1e-8), identity_quat
-    )
-
-    singular_values = gaussians_ndc.singular_values
+    quat_norm_abs = quat_norm.abs()
+    quat_finite = torch.isfinite(quat_norm)
+    quat_too_small = quat_norm_abs <= 1e-8
+    quat_off_unit = (quat_norm_abs - 1.0).abs() > 1e-3
+    quat_valid = quat_finite & ~quat_too_small
+    need_quat_fix = bool((~quat_finite).any() | quat_too_small.any() | quat_off_unit.any())
     bad_scales = ~torch.isfinite(singular_values) | (singular_values <= 0)
-    if bad_scales.any():
+    bad_scales_any = bool(bad_scales.any())
+    if bad_scales_any:
         LOGGER.warning(
             "Repairing %d invalid singular value entries.",
             int(bad_scales.sum().item()),
         )
         singular_values = singular_values.clone()
         singular_values[bad_scales] = 1e-3
-    gaussians_ndc = Gaussians3D(
-        mean_vectors=gaussians_ndc.mean_vectors,
-        singular_values=singular_values,
-        quaternions=quaternions,
-        colors=gaussians_ndc.colors,
-        opacities=gaussians_ndc.opacities,
-    )
+    if need_quat_fix:
+        identity_quat = torch.tensor(
+            [0.0, 0.0, 0.0, 1.0], device=quaternions.device, dtype=quaternions.dtype
+        )
+        quaternions = torch.where(
+            quat_valid, quaternions / quat_norm.clamp_min(1e-8), identity_quat
+        )
+
+    if need_cast or need_quat_fix or bad_scales_any:
+        gaussians_ndc = Gaussians3D(
+            mean_vectors=mean_vectors,
+            singular_values=singular_values,
+            quaternions=quaternions,
+            colors=colors,
+            opacities=opacities,
+        )
+    else:
+        gaussians_ndc = gaussians_ndc_one
 
     gaussians_world = None
     unprojection_matrix = None
@@ -739,7 +778,7 @@ def predict_image(
     return_unprojection_context: bool = False,
 ) -> PredictionResult:
     """Predict Gaussians from an image."""
-    internal_shape = (1536, 1536)
+    target_size_wh = (1536, 1536)
 
     LOGGER.info("Running preprocessing.")
     preprocess_start = perf_counter() if metrics else None
@@ -747,7 +786,7 @@ def predict_image(
         image,
         f_px,
         device,
-        target_size_wh=internal_shape,
+        target_size_wh=target_size_wh,
         dtype=torch.float32,
     )
     aux["metrics"] = metrics
@@ -772,13 +811,7 @@ def predict_image(
 
     LOGGER.info("Running postprocessing.")
     postprocess_start = perf_counter() if metrics else None
-    gaussians_ndc_one = Gaussians3D(
-        mean_vectors=gaussians_ndc_batch.mean_vectors[0].float(),
-        singular_values=gaussians_ndc_batch.singular_values[0].float(),
-        quaternions=gaussians_ndc_batch.quaternions[0].float(),
-        colors=gaussians_ndc_batch.colors[0].float(),
-        opacities=gaussians_ndc_batch.opacities[0].float(),
-    )
+    gaussians_ndc_one = _slice_gaussians(gaussians_ndc_batch, 0)
     prediction = postprocess_one(
         gaussians_ndc_one,
         aux,
