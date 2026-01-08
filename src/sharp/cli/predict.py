@@ -7,8 +7,11 @@ Copyright (C) 2025 Apple Inc. All Rights Reserved.
 from __future__ import annotations
 
 import logging
+import queue
+import threading
 from time import perf_counter
 from dataclasses import dataclass
+import io as py_io
 from pathlib import Path
 from typing import Any, Literal
 
@@ -17,6 +20,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.utils.data
+from PIL import Image
 
 from sharp.models import (
     PredictorParams,
@@ -58,6 +62,86 @@ class PredictionResult:
     world: Gaussians3D | None = None
     unprojection_matrix: torch.Tensor | None = None
     unprojection_context: UnprojectionContext | None = None
+
+
+_SBS_ASYNC_QUEUE_SIZE = 8
+_SBS_ASYNC_WORKERS = 1
+
+
+class AsyncImageWriter:
+    def __init__(self, maxsize: int = _SBS_ASYNC_QUEUE_SIZE, workers: int = _SBS_ASYNC_WORKERS):
+        self._queue: queue.Queue[tuple[Path, np.ndarray | Image.Image, str | None, int] | None]
+        self._queue = queue.Queue(maxsize=maxsize)
+        self._threads: list[threading.Thread] = []
+        self._error: BaseException | None = None
+        self._closed = False
+        for idx in range(workers):
+            thread = threading.Thread(target=self._worker, name=f"sbs-writer-{idx}", daemon=True)
+            thread.start()
+            self._threads.append(thread)
+
+    def submit(
+        self,
+        path: Path,
+        image: np.ndarray | Image.Image,
+        *,
+        sbs_image_format: str | None,
+        sbs_jpeg_quality: int,
+    ) -> None:
+        self.raise_if_failed()
+        if self._closed:
+            raise click.ClickException("Async SBS writer is closed.")
+        self._queue.put((path, image, sbs_image_format, sbs_jpeg_quality))
+        self.raise_if_failed()
+
+    def raise_if_failed(self) -> None:
+        if self._error is not None:
+            raise click.ClickException(f"Async SBS writer failed: {self._error}") from self._error
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for _ in self._threads:
+            self._queue.put(None)
+        for thread in self._threads:
+            thread.join()
+        self.raise_if_failed()
+
+    def _worker(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            path, image, sbs_image_format, sbs_jpeg_quality = item
+            try:
+                self._save_image(path, image, sbs_image_format, sbs_jpeg_quality)
+            except BaseException as exc:  # pragma: no cover - best-effort propagation
+                if self._error is None:
+                    self._error = exc
+            finally:
+                self._queue.task_done()
+
+    def _save_image(
+        self,
+        path: Path,
+        image: np.ndarray | Image.Image,
+        sbs_image_format: str | None,
+        sbs_jpeg_quality: int,
+    ) -> None:
+        img = image if isinstance(image, Image.Image) else Image.fromarray(image, mode="RGB")
+        img_format = Image.registered_extensions().get(path.suffix.lower())
+        save_kwargs: dict[str, object] = {}
+        if sbs_image_format == "jpg":
+            img = img.convert("RGB")
+            save_kwargs = {"quality": sbs_jpeg_quality, "subsampling": 0, "optimize": False}
+        if img_format is None:
+            img.save(path, **save_kwargs)
+        else:
+            bytes_io = py_io.BytesIO()
+            img.save(bytes_io, format=img_format, **save_kwargs)
+            with path.open("wb") as file_handle:
+                file_handle.write(bytes_io.getvalue())
 
 
 def _align_for_compare(
@@ -390,6 +474,11 @@ def predict_cli(
     if want_render_trajectory or want_sbs_image or fast_preview_render or fast_preview_compare:
         metrics.render_timing = RenderTiming()
 
+    sbs_async_writer: AsyncImageWriter | None = None
+    if want_sbs_image and not fast_preview_compare:
+        sbs_async_writer = AsyncImageWriter()
+        LOGGER.info("Async SBS image writer enabled.")
+
     def _finalize_prediction(
         *,
         prediction: PredictionResult,
@@ -402,6 +491,7 @@ def predict_cli(
         width: int,
         intrinsics: torch.Tensor,
         image_start: float,
+        sbs_async_writer: AsyncImageWriter | None,
     ) -> None:
         # Determine SBS image output path (optional)
         sbs_image_path: Path | None = None
@@ -469,6 +559,7 @@ def predict_cli(
                         sbs_image_frame=sbs_image_frame,
                         align_crop=align_crop,
                         metrics=metrics,
+                        sbs_async_writer=None,
                     )
                 render_gaussians_pred_space(
                     gaussians=prediction.pred,
@@ -481,6 +572,7 @@ def predict_cli(
                     sbs_image_frame=sbs_image_frame,
                     align_crop=align_crop,
                     metrics=metrics,
+                    sbs_async_writer=None if fast_preview_compare else sbs_async_writer,
                 )
                 if fast_preview_compare and sbs_image_path is not None:
                     try:
@@ -514,6 +606,7 @@ def predict_cli(
                     sbs_image_frame=sbs_image_frame,
                     align_crop=align_crop,
                     metrics=metrics,
+                    sbs_async_writer=sbs_async_writer,
                 )
             metrics.add_time("render_total", perf_counter() - render_start)
 
@@ -554,93 +647,14 @@ def predict_cli(
         metrics.add_time("per_image_total", perf_counter() - image_start)
 
     run_start = perf_counter()
-    if batch_size <= 1 or len(image_paths) == 1:
-        for index, image_path in enumerate(image_paths, start=1):
-            image_start = perf_counter()
-            rel_path = image_path.relative_to(input_path) if input_is_dir else Path(image_path.name)
-            out_dir = output_path / rel_path.parent if input_is_dir else output_path
-            out_dir.mkdir(parents=True, exist_ok=True)
-            LOGGER.info("Processing %s (%d/%d)", image_path, index, len(image_paths))
-            io_start = perf_counter()
-            image, _, f_px = io.load_rgb(image_path)
-            metrics.add_time("io_decode", perf_counter() - io_start)
-            height, width = image.shape[:2]
-            intrinsics = torch.tensor(
-                [
-                    [f_px, 0, (width - 1) / 2.0, 0],
-                    [0, f_px, (height - 1) / 2.0, 0],
-                    [0, 0, 1, 0],
-                    [0, 0, 0, 1],
-                ],
-                device=device,
-                dtype=torch.float32,
-            )
-            want_world_for_render = (
-                want_render_trajectory
-                or (want_sbs_image and not fast_preview_render)
-                or fast_preview_compare
-            )
-            defer_export_world = defer_world_conversion_for_export or (
-                fast_preview_render and not fast_preview_compare
-            )
-            want_world_for_predict = want_world_for_render or (
-                effective_save_ply and not defer_export_world
-            )
-            if skip_world_conversion and (want_world_for_predict or effective_save_ply):
-                raise click.ClickException(
-                    "World-space conversion is required for rendering or PLY export. "
-                    "Disable --skip-world-conversion or disable those outputs."
-                )
-            if skip_world_conversion:
-                LOGGER.info("Skipping world conversion (unproject/apply_transform).")
-            if fast_preview_render and not want_world_for_predict:
-                if effective_save_ply:
-                    LOGGER.info("Using fast preview render; deferring world conversion for export.")
-                else:
-                    LOGGER.info("Using fast preview render; skipping world conversion.")
-            space: GaussianSpace = "world" if want_world_for_predict else "pred"
-            LOGGER.info("Computing world-space gaussians: %s", "yes" if space == "world" else "no")
-
-            predict_start = perf_counter()
-            prediction = predict_image(
-                gaussian_predictor,
-                image,
-                f_px,
-                torch.device(device),
-                amp_enabled=amp,
-                amp_dtype=amp_dtype_to_use,
-                metrics=metrics,
-                return_world=want_world_for_predict,
-                return_unprojection=fast_preview_render,
-                return_unprojection_context=fast_preview_render or effective_save_ply,
-            )
-            metrics.add_time("predict_total", perf_counter() - predict_start)
-            _finalize_prediction(
-                prediction=prediction,
-                image_path=image_path,
-                rel_path=rel_path,
-                out_dir=out_dir,
-                image=image,
-                f_px=f_px,
-                height=height,
-                width=width,
-                intrinsics=intrinsics,
-                image_start=image_start,
-            )
-    else:
-        total_images = len(image_paths)
-        for batch_start in range(0, total_images, batch_size):
-            batch_paths = image_paths[batch_start : batch_start + batch_size]
-            batch_items: list[dict[str, Any]] = []
-            for offset, image_path in enumerate(batch_paths):
-                index = batch_start + offset + 1
+    try:
+        if batch_size <= 1 or len(image_paths) == 1:
+            for index, image_path in enumerate(image_paths, start=1):
                 image_start = perf_counter()
-                rel_path = (
-                    image_path.relative_to(input_path) if input_is_dir else Path(image_path.name)
-                )
+                rel_path = image_path.relative_to(input_path) if input_is_dir else Path(image_path.name)
                 out_dir = output_path / rel_path.parent if input_is_dir else output_path
                 out_dir.mkdir(parents=True, exist_ok=True)
-                LOGGER.info("Processing %s (%d/%d)", image_path, index, total_images)
+                LOGGER.info("Processing %s (%d/%d)", image_path, index, len(image_paths))
                 io_start = perf_counter()
                 image, _, f_px = io.load_rgb(image_path)
                 metrics.add_time("io_decode", perf_counter() - io_start)
@@ -675,120 +689,207 @@ def predict_cli(
                     LOGGER.info("Skipping world conversion (unproject/apply_transform).")
                 if fast_preview_render and not want_world_for_predict:
                     if effective_save_ply:
-                        LOGGER.info(
-                            "Using fast preview render; deferring world conversion for export."
-                        )
+                        LOGGER.info("Using fast preview render; deferring world conversion for export.")
                     else:
                         LOGGER.info("Using fast preview render; skipping world conversion.")
                 space: GaussianSpace = "world" if want_world_for_predict else "pred"
-                LOGGER.info(
-                    "Computing world-space gaussians: %s", "yes" if space == "world" else "no"
-                )
+                LOGGER.info("Computing world-space gaussians: %s", "yes" if space == "world" else "no")
 
-                preprocess_start = perf_counter() if metrics else None
-                image_resized_pt, disparity_factor, aux = preprocess_one(
+                predict_start = perf_counter()
+                prediction = predict_image(
+                    gaussian_predictor,
                     image,
                     f_px,
                     torch.device(device),
-                    target_size_wh=(1536, 1536),
-                    dtype=torch.float32,
-                )
-                aux["metrics"] = metrics
-                preprocess_elapsed = 0.0
-                if metrics and preprocess_start is not None:
-                    preprocess_elapsed = perf_counter() - preprocess_start
-                    metrics.add_time("preprocess", preprocess_elapsed)
-                batch_items.append(
-                    {
-                        "image_path": image_path,
-                        "rel_path": rel_path,
-                        "out_dir": out_dir,
-                        "image": image,
-                        "f_px": f_px,
-                        "height": height,
-                        "width": width,
-                        "intrinsics": intrinsics,
-                        "image_start": image_start,
-                        "preprocess_elapsed": preprocess_elapsed,
-                        "want_world_for_predict": want_world_for_predict,
-                        "aux": aux,
-                        "image_resized_pt": image_resized_pt,
-                        "disparity_factor": disparity_factor,
-                    }
-                )
-
-            image_resized_batch = torch.cat(
-                [item["image_resized_pt"] for item in batch_items], dim=0
-            )
-            disparity_factor_batch = torch.cat(
-                [item["disparity_factor"] for item in batch_items], dim=0
-            )
-
-            forward_start = perf_counter() if metrics else None
-            try:
-                gaussians_ndc_batch = model_forward_batch(
-                    gaussian_predictor,
-                    image_resized_batch,
-                    disparity_factor_batch,
+                    amp_enabled=amp,
                     amp_dtype=amp_dtype_to_use,
+                    metrics=metrics,
+                    return_world=want_world_for_predict,
+                    return_unprojection=fast_preview_render,
+                    return_unprojection_context=fast_preview_render or effective_save_ply,
                 )
-            except torch.cuda.OutOfMemoryError as exc:
-                if device == "cuda":
-                    torch.cuda.empty_cache()
-                raise click.ClickException(
-                    f"CUDA out of memory during batched forward (batch_size={len(batch_items)}). "
-                    "Try a smaller --batch-size."
-                ) from exc
-            except RuntimeError as exc:
-                if "out of memory" in str(exc).lower():
+                metrics.add_time("predict_total", perf_counter() - predict_start)
+                _finalize_prediction(
+                    prediction=prediction,
+                    image_path=image_path,
+                    rel_path=rel_path,
+                    out_dir=out_dir,
+                    image=image,
+                    f_px=f_px,
+                    height=height,
+                    width=width,
+                    intrinsics=intrinsics,
+                    image_start=image_start,
+                    sbs_async_writer=sbs_async_writer,
+                )
+        else:
+            total_images = len(image_paths)
+            for batch_start in range(0, total_images, batch_size):
+                batch_paths = image_paths[batch_start : batch_start + batch_size]
+                batch_items: list[dict[str, Any]] = []
+                for offset, image_path in enumerate(batch_paths):
+                    index = batch_start + offset + 1
+                    image_start = perf_counter()
+                    rel_path = (
+                        image_path.relative_to(input_path) if input_is_dir else Path(image_path.name)
+                    )
+                    out_dir = output_path / rel_path.parent if input_is_dir else output_path
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    LOGGER.info("Processing %s (%d/%d)", image_path, index, total_images)
+                    io_start = perf_counter()
+                    image, _, f_px = io.load_rgb(image_path)
+                    metrics.add_time("io_decode", perf_counter() - io_start)
+                    height, width = image.shape[:2]
+                    intrinsics = torch.tensor(
+                        [
+                            [f_px, 0, (width - 1) / 2.0, 0],
+                            [0, f_px, (height - 1) / 2.0, 0],
+                            [0, 0, 1, 0],
+                            [0, 0, 0, 1],
+                        ],
+                        device=device,
+                        dtype=torch.float32,
+                    )
+                    want_world_for_render = (
+                        want_render_trajectory
+                        or (want_sbs_image and not fast_preview_render)
+                        or fast_preview_compare
+                    )
+                    defer_export_world = defer_world_conversion_for_export or (
+                        fast_preview_render and not fast_preview_compare
+                    )
+                    want_world_for_predict = want_world_for_render or (
+                        effective_save_ply and not defer_export_world
+                    )
+                    if skip_world_conversion and (want_world_for_predict or effective_save_ply):
+                        raise click.ClickException(
+                            "World-space conversion is required for rendering or PLY export. "
+                            "Disable --skip-world-conversion or disable those outputs."
+                        )
+                    if skip_world_conversion:
+                        LOGGER.info("Skipping world conversion (unproject/apply_transform).")
+                    if fast_preview_render and not want_world_for_predict:
+                        if effective_save_ply:
+                            LOGGER.info(
+                                "Using fast preview render; deferring world conversion for export."
+                            )
+                        else:
+                            LOGGER.info("Using fast preview render; skipping world conversion.")
+                    space: GaussianSpace = "world" if want_world_for_predict else "pred"
+                    LOGGER.info(
+                        "Computing world-space gaussians: %s", "yes" if space == "world" else "no"
+                    )
+
+                    preprocess_start = perf_counter() if metrics else None
+                    image_resized_pt, disparity_factor, aux = preprocess_one(
+                        image,
+                        f_px,
+                        torch.device(device),
+                        target_size_wh=(1536, 1536),
+                        dtype=torch.float32,
+                    )
+                    aux["metrics"] = metrics
+                    preprocess_elapsed = 0.0
+                    if metrics and preprocess_start is not None:
+                        preprocess_elapsed = perf_counter() - preprocess_start
+                        metrics.add_time("preprocess", preprocess_elapsed)
+                    batch_items.append(
+                        {
+                            "image_path": image_path,
+                            "rel_path": rel_path,
+                            "out_dir": out_dir,
+                            "image": image,
+                            "f_px": f_px,
+                            "height": height,
+                            "width": width,
+                            "intrinsics": intrinsics,
+                            "image_start": image_start,
+                            "preprocess_elapsed": preprocess_elapsed,
+                            "want_world_for_predict": want_world_for_predict,
+                            "aux": aux,
+                            "image_resized_pt": image_resized_pt,
+                            "disparity_factor": disparity_factor,
+                        }
+                    )
+
+                image_resized_batch = torch.cat(
+                    [item["image_resized_pt"] for item in batch_items], dim=0
+                )
+                disparity_factor_batch = torch.cat(
+                    [item["disparity_factor"] for item in batch_items], dim=0
+                )
+
+                forward_start = perf_counter() if metrics else None
+                try:
+                    gaussians_ndc_batch = model_forward_batch(
+                        gaussian_predictor,
+                        image_resized_batch,
+                        disparity_factor_batch,
+                        amp_dtype=amp_dtype_to_use,
+                    )
+                except torch.cuda.OutOfMemoryError as exc:
                     if device == "cuda":
                         torch.cuda.empty_cache()
                     raise click.ClickException(
                         f"CUDA out of memory during batched forward (batch_size={len(batch_items)}). "
                         "Try a smaller --batch-size."
                     ) from exc
-                raise
-            forward_elapsed = 0.0
-            if metrics and forward_start is not None:
-                forward_elapsed = perf_counter() - forward_start
-                metrics.add_time("model_forward", forward_elapsed)
+                except RuntimeError as exc:
+                    if "out of memory" in str(exc).lower():
+                        if device == "cuda":
+                            torch.cuda.empty_cache()
+                        raise click.ClickException(
+                            f"CUDA out of memory during batched forward (batch_size={len(batch_items)}). "
+                            "Try a smaller --batch-size."
+                        ) from exc
+                    raise
+                forward_elapsed = 0.0
+                if metrics and forward_start is not None:
+                    forward_elapsed = perf_counter() - forward_start
+                    metrics.add_time("model_forward", forward_elapsed)
 
-            postprocess_start = perf_counter() if metrics else None
-            for batch_index, item in enumerate(batch_items):
-                gaussians_ndc_one = _slice_gaussians(gaussians_ndc_batch, batch_index)
-                prediction = postprocess_one(
-                    gaussians_ndc_one,
-                    item["aux"],
-                    return_world=item["want_world_for_predict"],
-                    return_unprojection=fast_preview_render or effective_save_ply,
-                    device=torch.device(device),
-                )
-                item["prediction"] = prediction
-            postprocess_elapsed = 0.0
-            if metrics and postprocess_start is not None:
-                postprocess_elapsed = perf_counter() - postprocess_start
-                metrics.add_time("postprocess", postprocess_elapsed)
+                postprocess_start = perf_counter() if metrics else None
+                for batch_index, item in enumerate(batch_items):
+                    gaussians_ndc_one = _slice_gaussians(gaussians_ndc_batch, batch_index)
+                    prediction = postprocess_one(
+                        gaussians_ndc_one,
+                        item["aux"],
+                        return_world=item["want_world_for_predict"],
+                        return_unprojection=fast_preview_render or effective_save_ply,
+                        device=torch.device(device),
+                    )
+                    item["prediction"] = prediction
+                postprocess_elapsed = 0.0
+                if metrics and postprocess_start is not None:
+                    postprocess_elapsed = perf_counter() - postprocess_start
+                    metrics.add_time("postprocess", postprocess_elapsed)
 
-            batch_count = len(batch_items)
-            forward_share = forward_elapsed / batch_count if batch_count else 0.0
-            postprocess_share = postprocess_elapsed / batch_count if batch_count else 0.0
-            for item in batch_items:
-                predict_total = (
-                    item["preprocess_elapsed"] + forward_share + postprocess_share
-                )
-                metrics.add_time("predict_total", predict_total)
-                _finalize_prediction(
-                    prediction=item["prediction"],
-                    image_path=item["image_path"],
-                    rel_path=item["rel_path"],
-                    out_dir=item["out_dir"],
-                    image=item["image"],
-                    f_px=item["f_px"],
-                    height=item["height"],
-                    width=item["width"],
-                    intrinsics=item["intrinsics"],
-                    image_start=item["image_start"],
-                )
+                batch_count = len(batch_items)
+                forward_share = forward_elapsed / batch_count if batch_count else 0.0
+                postprocess_share = postprocess_elapsed / batch_count if batch_count else 0.0
+                for item in batch_items:
+                    predict_total = (
+                        item["preprocess_elapsed"] + forward_share + postprocess_share
+                    )
+                    metrics.add_time("predict_total", predict_total)
+                    _finalize_prediction(
+                        prediction=item["prediction"],
+                        image_path=item["image_path"],
+                        rel_path=item["rel_path"],
+                        out_dir=item["out_dir"],
+                        image=item["image"],
+                        f_px=item["f_px"],
+                        height=item["height"],
+                        width=item["width"],
+                        intrinsics=item["intrinsics"],
+                        image_start=item["image_start"],
+                        sbs_async_writer=sbs_async_writer,
+                    )
+    finally:
+        if sbs_async_writer is not None:
+            drain_start = perf_counter()
+            sbs_async_writer.close()
+            metrics.add_time("sbs_async_drain", perf_counter() - drain_start)
     metrics.add_time("run_total", perf_counter() - run_start)
     _log_metrics_summary(metrics)
 
