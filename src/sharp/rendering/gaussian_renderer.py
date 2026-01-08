@@ -11,7 +11,34 @@ from PIL import Image
 
 from sharp.utils import camera, gsplat, io
 from sharp.utils.gaussians import Gaussians3D, SceneMetaData
-from sharp.utils.metrics import Metrics
+from sharp.utils.metrics import Metrics, RenderTiming
+
+
+def _save_sbs_image(
+    img: Image.Image,
+    sbs_image_path: Path,
+    sbs_image_format: str | None,
+    sbs_jpeg_quality: int,
+    render_timing: RenderTiming | None,
+) -> None:
+    img_format = Image.registered_extensions().get(sbs_image_path.suffix.lower())
+    save_kwargs: dict[str, object] = {}
+    if sbs_image_format == "jpg":
+        img = img.convert("RGB")
+        save_kwargs = {"quality": sbs_jpeg_quality, "subsampling": 0, "optimize": False}
+    if render_timing:
+        if img_format is None:
+            with render_timing.timed_cpu("render_encode_write"):
+                img.save(sbs_image_path, **save_kwargs)
+        else:
+            with render_timing.timed_cpu("render_encode_compress"):
+                bytes_io = py_io.BytesIO()
+                img.save(bytes_io, format=img_format, **save_kwargs)
+            with render_timing.timed_cpu("render_encode_write"):
+                with sbs_image_path.open("wb") as file_handle:
+                    file_handle.write(bytes_io.getvalue())
+    else:
+        img.save(sbs_image_path, **save_kwargs)
 
 
 def render_gaussians(
@@ -20,6 +47,8 @@ def render_gaussians(
     output_path: Path,
     params: camera.TrajectoryParams | None = None,
     sbs_image_path: Path | None = None,
+    sbs_image_format: str | None = None,
+    sbs_jpeg_quality: int = 90,
     sbs_image_frame: int = 0,
     align_crop: bool = False,
     metrics: Metrics | None = None,
@@ -198,17 +227,13 @@ def render_gaussians(
                     color_sbs_np = np.concatenate((color_l_np, color_r_np), axis=1)
                     img = Image.fromarray(color_sbs_np, mode="RGB")
                     sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
-                img_format = Image.registered_extensions().get(sbs_image_path.suffix.lower())
-                if img_format is None:
-                    with render_timing.timed_cpu("render_encode_write"):
-                        img.save(sbs_image_path)
-                else:
-                    with render_timing.timed_cpu("render_encode_compress"):
-                        bytes_io = py_io.BytesIO()
-                        img.save(bytes_io, format=img_format)
-                    with render_timing.timed_cpu("render_encode_write"):
-                        with sbs_image_path.open("wb") as file_handle:
-                            file_handle.write(bytes_io.getvalue())
+                _save_sbs_image(
+                    img,
+                    sbs_image_path,
+                    sbs_image_format,
+                    sbs_jpeg_quality,
+                    render_timing,
+                )
             else:
                 if align_crop:
                     try:
@@ -227,7 +252,13 @@ def render_gaussians(
                 color_sbs_np = np.concatenate((color_l_np, color_r_np), axis=1)
                 img = Image.fromarray(color_sbs_np, mode="RGB")
                 sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
-                img.save(sbs_image_path)
+                _save_sbs_image(
+                    img,
+                    sbs_image_path,
+                    sbs_image_format,
+                    sbs_jpeg_quality,
+                    None,
+                )
             if render_timing:
                 render_timing.finalize_frame()
             break
@@ -254,6 +285,8 @@ def render_gaussians_pred_space(
     unprojection_matrix: torch.Tensor,
     params: camera.TrajectoryParams | None = None,
     sbs_image_path: Path | None = None,
+    sbs_image_format: str | None = None,
+    sbs_jpeg_quality: int = 90,
     sbs_image_frame: int = 0,
     align_crop: bool = False,
     metrics: Metrics | None = None,
@@ -445,17 +478,13 @@ def render_gaussians_pred_space(
                     color_sbs_np = np.concatenate((color_l_np, color_r_np), axis=1)
                     img = Image.fromarray(color_sbs_np, mode="RGB")
                     sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
-                img_format = Image.registered_extensions().get(sbs_image_path.suffix.lower())
-                if img_format is None:
-                    with render_timing.timed_cpu("render_encode_write"):
-                        img.save(sbs_image_path)
-                else:
-                    with render_timing.timed_cpu("render_encode_compress"):
-                        bytes_io = py_io.BytesIO()
-                        img.save(bytes_io, format=img_format)
-                    with render_timing.timed_cpu("render_encode_write"):
-                        with sbs_image_path.open("wb") as file_handle:
-                            file_handle.write(bytes_io.getvalue())
+                _save_sbs_image(
+                    img,
+                    sbs_image_path,
+                    sbs_image_format,
+                    sbs_jpeg_quality,
+                    render_timing,
+                )
             else:
                 if align_crop:
                     try:
@@ -474,7 +503,13 @@ def render_gaussians_pred_space(
                 color_sbs_np = np.concatenate((color_l_np, color_r_np), axis=1)
                 img = Image.fromarray(color_sbs_np, mode="RGB")
                 sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
-                img.save(sbs_image_path)
+                _save_sbs_image(
+                    img,
+                    sbs_image_path,
+                    sbs_image_format,
+                    sbs_jpeg_quality,
+                    None,
+                )
             if render_timing:
                 render_timing.finalize_frame()
             break
