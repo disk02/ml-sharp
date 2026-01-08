@@ -112,6 +112,7 @@ class AsyncImageWriter:
         while True:
             item = self._queue.get()
             if item is None:
+                self._queue.task_done()
                 return
             path, image, sbs_image_format, sbs_jpeg_quality = item
             try:
@@ -1210,6 +1211,7 @@ def _log_metrics_summary(metrics: Metrics) -> None:
         "export_world_convert",
         "save_ply",
         "per_image_total",
+        "sbs_async_drain",
         "run_total",
     ]
 
