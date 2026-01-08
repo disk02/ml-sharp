@@ -585,56 +585,75 @@ def predict_cli(
     _log_metrics_summary(metrics)
 
 
-def predict_image(
-    predictor: RGBGaussianPredictor,
-    image: np.ndarray,
+def preprocess_one(
+    image_np: np.ndarray,
     f_px: float,
     device: torch.device,
-    amp_enabled: bool,
-    amp_dtype: torch.dtype,
-    metrics: Metrics | None = None,
-    return_world: bool = True,
-    return_unprojection: bool = False,
-    return_unprojection_context: bool = False,
-) -> PredictionResult:
-    """Predict Gaussians from an image."""
-    internal_shape = (1536, 1536)
-
-    LOGGER.info("Running preprocessing.")
-    preprocess_start = perf_counter() if metrics else None
-    image_pt = torch.from_numpy(image.copy()).float().to(device).permute(2, 0, 1) / 255.0
+    *,
+    target_resolution: tuple[int, int],
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, dict]:
+    image_pt = (
+        torch.from_numpy(image_np.copy()).to(dtype=dtype, device=device).permute(2, 0, 1)
+        / 255.0
+    )
     _, height, width = image_pt.shape
-    disparity_factor = torch.tensor([f_px / width]).float().to(device)
-
+    disparity_factor_pt = torch.tensor([f_px / width], dtype=dtype, device=device)
     image_resized_pt = F.interpolate(
         image_pt[None],
-        size=(internal_shape[1], internal_shape[0]),
+        size=(target_resolution[1], target_resolution[0]),
         mode="bilinear",
         align_corners=True,
     )
-    if metrics and preprocess_start is not None:
-        metrics.add_time("preprocess", perf_counter() - preprocess_start)
+    # image_resized_pt: (B, C, H, W) with B=1 for now.
+    if __debug__:
+        assert image_resized_pt.ndim == 4
+        assert image_resized_pt.shape[0] == 1
+        assert disparity_factor_pt.ndim >= 1
+        assert disparity_factor_pt.shape[0] == 1
+    aux = {
+        "height": height,
+        "width": width,
+        "f_px": f_px,
+        "internal_shape": target_resolution,
+    }
+    return image_resized_pt, disparity_factor_pt, aux
 
-    # Predict Gaussians in the NDC space.
-    LOGGER.info("Running inference.")
-    forward_start = perf_counter() if metrics else None
+
+@torch.no_grad()
+def model_forward_batch(
+    predictor: torch.nn.Module,
+    image_resized_pt: torch.Tensor,
+    disparity_factor_pt: torch.Tensor,
+    *,
+    amp: bool,
+) -> Any:
+    autocast_dtype = image_resized_pt.dtype
+    if amp and image_resized_pt.device.type == "cuda":
+        get_dtype = getattr(torch, "get_autocast_gpu_dtype", None)
+        if callable(get_dtype):
+            autocast_dtype = get_dtype()
     with torch.inference_mode():
-        if amp_enabled and device.type == "cuda":
-            with torch.autocast(device_type="cuda", dtype=amp_dtype):
-                gaussians_ndc = predictor(image_resized_pt, disparity_factor)
-        else:
-            gaussians_ndc = predictor(image_resized_pt, disparity_factor)
-    if metrics and forward_start is not None:
-        metrics.add_time("model_forward", perf_counter() - forward_start)
+        if amp and image_resized_pt.device.type == "cuda":
+            with torch.autocast(device_type="cuda", dtype=autocast_dtype):
+                return predictor(image_resized_pt, disparity_factor_pt)
+        return predictor(image_resized_pt, disparity_factor_pt)
 
-    LOGGER.info("Running postprocessing.")
-    postprocess_start = perf_counter() if metrics else None
+
+def postprocess_one(
+    gaussians_ndc_one: Any,
+    aux: dict,
+    *,
+    return_world: bool,
+    return_unprojection: bool,
+    device: torch.device,
+) -> PredictionResult:
     gaussians_ndc = Gaussians3D(
-        mean_vectors=gaussians_ndc.mean_vectors.float(),
-        singular_values=gaussians_ndc.singular_values.float(),
-        quaternions=gaussians_ndc.quaternions.float(),
-        colors=gaussians_ndc.colors.float(),
-        opacities=gaussians_ndc.opacities.float(),
+        mean_vectors=gaussians_ndc_one.mean_vectors.float(),
+        singular_values=gaussians_ndc_one.singular_values.float(),
+        quaternions=gaussians_ndc_one.quaternions.float(),
+        colors=gaussians_ndc_one.colors.float(),
+        opacities=gaussians_ndc_one.opacities.float(),
     )
     quaternions = gaussians_ndc.quaternions
     quat_norm = quaternions.norm(dim=-1, keepdim=True)
@@ -666,7 +685,11 @@ def predict_image(
     gaussians_world = None
     unprojection_matrix = None
     unprojection_context = None
-    if return_world or return_unprojection or return_unprojection_context:
+    if return_world or return_unprojection:
+        height = aux["height"]
+        width = aux["width"]
+        f_px = aux["f_px"]
+        internal_shape = aux["internal_shape"]
         intrinsics = (
             torch.tensor(
                 [
@@ -692,22 +715,96 @@ def predict_image(
                 torch.eye(4).to(device), intrinsics_resized, internal_shape
             )
         if return_world:
-            # Convert Gaussians to metrics space.
             gaussians_world = unproject_gaussians(
                 gaussians_ndc,
                 torch.eye(4).to(device),
                 intrinsics_resized,
                 internal_shape,
-                metrics=metrics,
+                metrics=aux.get("metrics"),
             )
-    if metrics and postprocess_start is not None:
-        metrics.add_time("postprocess", perf_counter() - postprocess_start)
 
     return PredictionResult(
         pred=gaussians_ndc,
         world=gaussians_world,
         unprojection_matrix=unprojection_matrix,
         unprojection_context=unprojection_context,
+    )
+
+
+def predict_image(
+    predictor: RGBGaussianPredictor,
+    image: np.ndarray,
+    f_px: float,
+    device: torch.device,
+    amp_enabled: bool,
+    amp_dtype: torch.dtype,
+    metrics: Metrics | None = None,
+    return_world: bool = True,
+    return_unprojection: bool = False,
+    return_unprojection_context: bool = False,
+) -> PredictionResult:
+    """Predict Gaussians from an image."""
+    internal_shape = (1536, 1536)
+
+    LOGGER.info("Running preprocessing.")
+    preprocess_start = perf_counter() if metrics else None
+    image_resized_pt, disparity_factor, aux = preprocess_one(
+        image,
+        f_px,
+        device,
+        target_resolution=internal_shape,
+        dtype=torch.float32,
+    )
+    aux["metrics"] = metrics
+    if metrics and preprocess_start is not None:
+        metrics.add_time("preprocess", perf_counter() - preprocess_start)
+
+    LOGGER.info("Running inference.")
+    forward_start = perf_counter() if metrics else None
+    prev_autocast_dtype = None
+    if amp_enabled and device.type == "cuda":
+        get_dtype = getattr(torch, "get_autocast_gpu_dtype", None)
+        set_dtype = getattr(torch, "set_autocast_gpu_dtype", None)
+        if callable(get_dtype) and callable(set_dtype):
+            prev_autocast_dtype = get_dtype()
+            set_dtype(amp_dtype)
+    gaussians_ndc_batch = model_forward_batch(
+        predictor,
+        image_resized_pt,
+        disparity_factor,
+        amp=amp_enabled,
+    )
+    if prev_autocast_dtype is not None:
+        set_dtype = getattr(torch, "set_autocast_gpu_dtype", None)
+        if callable(set_dtype):
+            set_dtype(prev_autocast_dtype)
+    if metrics and forward_start is not None:
+        metrics.add_time("model_forward", perf_counter() - forward_start)
+
+    LOGGER.info("Running postprocessing.")
+    postprocess_start = perf_counter() if metrics else None
+    gaussians_ndc_one = Gaussians3D(
+        mean_vectors=gaussians_ndc_batch.mean_vectors[0],
+        singular_values=gaussians_ndc_batch.singular_values[0],
+        quaternions=gaussians_ndc_batch.quaternions[0],
+        colors=gaussians_ndc_batch.colors[0],
+        opacities=gaussians_ndc_batch.opacities[0],
+    )
+    prediction = postprocess_one(
+        gaussians_ndc_one,
+        aux,
+        return_world=return_world,
+        return_unprojection=return_unprojection or return_unprojection_context,
+        device=device,
+    )
+    if metrics and postprocess_start is not None:
+        metrics.add_time("postprocess", perf_counter() - postprocess_start)
+
+    return PredictionResult(
+        pred=prediction.pred,
+        world=prediction.world,
+        unprojection_matrix=prediction.unprojection_matrix,
+        unprojection_context=prediction.unprojection_context,
     )
 
 
