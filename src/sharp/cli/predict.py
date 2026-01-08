@@ -1006,11 +1006,8 @@ def predict_image(
 
     LOGGER.info("Running inference.")
     forward_start = perf_counter() if metrics else None
-    amp_dtype_to_use: torch.dtype | None = None
-    if amp_enabled and device.type == "cuda":
-        amp_dtype_to_use = amp_dtype
-        if amp_dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
-            amp_dtype_to_use = torch.float16
+    # amp_dtype is expected to be resolved by predict_cli (including bf16 fallback).
+    amp_dtype_to_use = amp_dtype if amp_enabled else None
     gaussians_ndc_batch = model_forward_batch(
         predictor,
         image_resized_pt,
