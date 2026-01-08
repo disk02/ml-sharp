@@ -16,6 +16,7 @@ from torch import nn
 from sharp.utils import color_space as cs_utils
 from sharp.utils import io, vis
 from sharp.utils.gaussians import BackgroundColor, Gaussians3D
+from sharp.utils.metrics import RenderTiming
 
 
 class RenderingOutputs(NamedTuple):
@@ -76,6 +77,7 @@ class GSplatRenderer(nn.Module):
         intrinsics: torch.Tensor,
         image_width: int,
         image_height: int,
+        render_timing: RenderTiming | None = None,
     ) -> RenderingOutputs:
         """Predict images from gaussians.
 
@@ -90,50 +92,92 @@ class GSplatRenderer(nn.Module):
         outputs_list: list[RenderingOutputs] = []
 
         for ib in range(batch_size):
-            colors, alphas, meta = gsplat.rendering.rasterization(
-                means=gaussians.mean_vectors[ib],
-                quats=gaussians.quaternions[ib],
-                scales=gaussians.singular_values[ib],
-                opacities=gaussians.opacities[ib],
-                colors=gaussians.colors[ib],
-                viewmats=extrinsics[ib : ib + 1],
-                Ks=intrinsics[ib : ib + 1, :3, :3],
-                width=image_width,
-                height=image_height,
-                render_mode="RGB+D",
-                rasterize_mode="classic",
-                absgrad=False,
-                packed=False,
-                eps2d=self.low_pass_filter_eps,
-            )
+            if render_timing is None:
+                colors, alphas, meta = gsplat.rendering.rasterization(
+                    means=gaussians.mean_vectors[ib],
+                    quats=gaussians.quaternions[ib],
+                    scales=gaussians.singular_values[ib],
+                    opacities=gaussians.opacities[ib],
+                    colors=gaussians.colors[ib],
+                    viewmats=extrinsics[ib : ib + 1],
+                    Ks=intrinsics[ib : ib + 1, :3, :3],
+                    width=image_width,
+                    height=image_height,
+                    render_mode="RGB+D",
+                    rasterize_mode="classic",
+                    absgrad=False,
+                    packed=False,
+                    eps2d=self.low_pass_filter_eps,
+                )
+            else:
+                # GPU project/sort is dominated by the rasterization kernel.
+                with render_timing.gpu_event_timer("render_gpu_project_sort"):
+                    colors, alphas, meta = gsplat.rendering.rasterization(
+                        means=gaussians.mean_vectors[ib],
+                        quats=gaussians.quaternions[ib],
+                        scales=gaussians.singular_values[ib],
+                        opacities=gaussians.opacities[ib],
+                        colors=gaussians.colors[ib],
+                        viewmats=extrinsics[ib : ib + 1],
+                        Ks=intrinsics[ib : ib + 1, :3, :3],
+                        width=image_width,
+                        height=image_height,
+                        render_mode="RGB+D",
+                        rasterize_mode="classic",
+                        absgrad=False,
+                        packed=False,
+                        eps2d=self.low_pass_filter_eps,
+                    )
 
             rendered_color = colors[..., 0:3].permute([0, 3, 1, 2])
             rendered_depth_unnormalized = colors[..., 3:4].permute([0, 3, 1, 2])
             rendered_alpha = alphas.permute([0, 3, 1, 2])
 
-            # Compose with background color.
-            rendered_color = self.compose_with_background(
-                rendered_color, rendered_alpha, self.background_color
-            )
-
-            # Colorspace conversion.
-            if self.color_space == "sRGB":
-                pass
-            elif self.color_space == "linearRGB":
-                rendered_color = cs_utils.linearRGB2sRGB(rendered_color)
+            # GPU shading covers background composition and colorspace conversion.
+            if render_timing is None:
+                rendered_color = self.compose_with_background(
+                    rendered_color, rendered_alpha, self.background_color
+                )
+                if self.color_space == "sRGB":
+                    pass
+                elif self.color_space == "linearRGB":
+                    rendered_color = cs_utils.linearRGB2sRGB(rendered_color)
+                else:
+                    ValueError("Unsupported ColorSpace type.")
             else:
-                ValueError("Unsupported ColorSpace type.")
+                with render_timing.gpu_event_timer("render_gpu_shading"):
+                    rendered_color = self.compose_with_background(
+                        rendered_color, rendered_alpha, self.background_color
+                    )
+                    if self.color_space == "sRGB":
+                        pass
+                    elif self.color_space == "linearRGB":
+                        rendered_color = cs_utils.linearRGB2sRGB(rendered_color)
+                    else:
+                        ValueError("Unsupported ColorSpace type.")
 
-            # splats: (B, N, 10)
-            cov2d = self._conics_to_covars2d(meta["conics"])
-            # Set the cov2d of invisible splats to 1 to avoid nan in condition number calculation..
-            splats_visible_mask = meta["depths"] > 1e-2
-            cov2d[~splats_visible_mask][..., 0, 0] = 1
-            cov2d[~splats_visible_mask][..., 1, 1] = 1
-            cov2d[~splats_visible_mask][..., 0, 1] = 0
+            # GPU raster/blend stage includes post-raster depth normalization work.
+            if render_timing is None:
+                # splats: (B, N, 10)
+                cov2d = self._conics_to_covars2d(meta["conics"])
+                # Set the cov2d of invisible splats to 1 to avoid nan in condition number calculation..
+                splats_visible_mask = meta["depths"] > 1e-2
+                cov2d[~splats_visible_mask][..., 0, 0] = 1
+                cov2d[~splats_visible_mask][..., 1, 1] = 1
+                cov2d[~splats_visible_mask][..., 0, 1] = 0
 
-            # Normalize the depth by alpha.
-            rendered_depth = rendered_depth_unnormalized / torch.clip(rendered_alpha, min=1e-8)
+                # Normalize the depth by alpha.
+                rendered_depth = rendered_depth_unnormalized / torch.clip(rendered_alpha, min=1e-8)
+            else:
+                with render_timing.gpu_event_timer("render_gpu_raster_blend"):
+                    cov2d = self._conics_to_covars2d(meta["conics"])
+                    splats_visible_mask = meta["depths"] > 1e-2
+                    cov2d[~splats_visible_mask][..., 0, 0] = 1
+                    cov2d[~splats_visible_mask][..., 1, 1] = 1
+                    cov2d[~splats_visible_mask][..., 0, 1] = 0
+                    rendered_depth = rendered_depth_unnormalized / torch.clip(
+                        rendered_alpha, min=1e-8
+                    )
 
             outputs = RenderingOutputs(
                 color=rendered_color,
