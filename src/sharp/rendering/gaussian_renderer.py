@@ -65,6 +65,7 @@ def render_gaussians(
         gaussians, params, resolution_px=metadata.resolution_px, f_px=f_px
     )
     renderer = gsplat.GSplatRenderer(color_space=metadata.color_space)
+    render_timing = metrics.render_timing if metrics else None
 
     # If only rendering SBS image, don't create video writer
     video_writer = io.VideoWriter(output_path) if sbs_image_path is None else None
@@ -72,75 +73,163 @@ def render_gaussians(
     for frame_idx, eye_mid in enumerate(trajectory):
         if metrics:
             metrics.inc("render_frames")
-        # Treat the trajectory as the *midpoint* between eyes so the midpoint stays centered.
-        eye_position_l = eye_mid.clone()
-        eye_position_l[0] -= baseline * 0.5
-        eye_position_r = eye_mid.clone()
-        eye_position_r[0] += baseline * 0.5
+        # Stage mapping: setup = camera pose prep, pack_inputs = assemble tensors,
+        # h2d_transfer = device copies, gpu_* = renderer/GPU post, d2h/output = readback + encode.
+        if render_timing:
+            render_timing.start_frame()
+        if render_timing:
+            with render_timing.timed_cpu("render_setup"):
+                # Treat the trajectory as the *midpoint* between eyes so the midpoint stays centered.
+                eye_position_l = eye_mid.clone()
+                eye_position_l[0] -= baseline * 0.5
+                eye_position_r = eye_mid.clone()
+                eye_position_r[0] += baseline * 0.5
+                camera_info_l = camera_model.compute(eye_position_l)
+                camera_info_r = camera_model.compute(eye_position_r)
+        else:
+            eye_position_l = eye_mid.clone()
+            eye_position_l[0] -= baseline * 0.5
+            eye_position_r = eye_mid.clone()
+            eye_position_r[0] += baseline * 0.5
+            camera_info_l = camera_model.compute(eye_position_l)
+            camera_info_r = camera_model.compute(eye_position_r)
+
+        if render_timing:
+            with render_timing.timed_cpu("render_pack_inputs"):
+                extrinsics_l = camera_info_l.extrinsics[None]
+                intrinsics_l = camera_info_l.intrinsics[None]
+                extrinsics_r = camera_info_r.extrinsics[None]
+                intrinsics_r = camera_info_r.intrinsics[None]
+        else:
+            extrinsics_l = camera_info_l.extrinsics[None]
+            intrinsics_l = camera_info_l.intrinsics[None]
+            extrinsics_r = camera_info_r.extrinsics[None]
+            intrinsics_r = camera_info_r.intrinsics[None]
+
+        if render_timing:
+            with render_timing.timed_cpu("render_h2d_transfer"):
+                gaussians_l = gaussians.to(device)
+                extrinsics_l = extrinsics_l.to(device)
+                intrinsics_l = intrinsics_l.to(device)
+                gaussians_r = gaussians.to(device)
+                extrinsics_r = extrinsics_r.to(device)
+                intrinsics_r = intrinsics_r.to(device)
+        else:
+            gaussians_l = gaussians.to(device)
+            extrinsics_l = extrinsics_l.to(device)
+            intrinsics_l = intrinsics_l.to(device)
+            gaussians_r = gaussians.to(device)
+            extrinsics_r = extrinsics_r.to(device)
+            intrinsics_r = intrinsics_r.to(device)
 
         # Left view
-        camera_info = camera_model.compute(eye_position_l)
-        rendering_output = renderer(
-            gaussians.to(device),
-            extrinsics=camera_info.extrinsics[None].to(device),
-            intrinsics=camera_info.intrinsics[None].to(device),
-            image_width=camera_info.width,
-            image_height=camera_info.height,
+        rendering_output_l = renderer(
+            gaussians_l,
+            extrinsics=extrinsics_l,
+            intrinsics=intrinsics_l,
+            image_width=camera_info_l.width,
+            image_height=camera_info_l.height,
+            render_timing=render_timing,
         )
-        color_l = (rendering_output.color[0].permute(1, 2, 0) * 255.0).to(
-            dtype=torch.uint8
-        )
-        depth_l = rendering_output.depth[0]
 
         # Right view
-        camera_info = camera_model.compute(eye_position_r)
-        rendering_output = renderer(
-            gaussians.to(device),
-            extrinsics=camera_info.extrinsics[None].to(device),
-            intrinsics=camera_info.intrinsics[None].to(device),
-            image_width=camera_info.width,
-            image_height=camera_info.height,
+        rendering_output_r = renderer(
+            gaussians_r,
+            extrinsics=extrinsics_r,
+            intrinsics=intrinsics_r,
+            image_width=camera_info_r.width,
+            image_height=camera_info_r.height,
+            render_timing=render_timing,
         )
-        color_r = (rendering_output.color[0].permute(1, 2, 0) * 255.0).to(
-            dtype=torch.uint8
-        )
-        depth_r = rendering_output.depth[0]
 
-        # Pack the left and right views into SBS format.
-        color = torch.cat((color_l, color_r), dim=1)
+        if render_timing:
+            with render_timing.gpu_event_timer("render_gpu_raster_blend"):
+                color_l = (rendering_output_l.color[0].permute(1, 2, 0) * 255.0).to(
+                    dtype=torch.uint8
+                )
+                depth_l = rendering_output_l.depth[0]
+                color_r = (rendering_output_r.color[0].permute(1, 2, 0) * 255.0).to(
+                    dtype=torch.uint8
+                )
+                depth_r = rendering_output_r.depth[0]
+                # Pack the left and right views into SBS format.
+                color = torch.cat((color_l, color_r), dim=1)
+        else:
+            color_l = (rendering_output_l.color[0].permute(1, 2, 0) * 255.0).to(
+                dtype=torch.uint8
+            )
+            depth_l = rendering_output_l.depth[0]
+            color_r = (rendering_output_r.color[0].permute(1, 2, 0) * 255.0).to(
+                dtype=torch.uint8
+            )
+            depth_r = rendering_output_r.depth[0]
+            color = torch.cat((color_l, color_r), dim=1)
 
         # Write SBS frame image if requested
         if sbs_image_path is not None and frame_idx == sbs_image_frame:
-            # Convert torch -> numpy (H,W,3) uint8
-            color_l_np = color_l.detach().cpu().numpy()
-            color_r_np = color_r.detach().cpu().numpy()
+            if render_timing:
+                with render_timing.timed_cpu("render_d2h_transfer"):
+                    # Convert torch -> numpy (H,W,3) uint8
+                    color_l_np = color_l.detach().cpu().numpy()
+                    color_r_np = color_r.detach().cpu().numpy()
+            else:
+                color_l_np = color_l.detach().cpu().numpy()
+                color_r_np = color_r.detach().cpu().numpy()
 
-            if align_crop:
-                # Import lazily so OpenCV isn't required unless --align-crop is used.
-                try:
-                    from sharp.utils.stereo_align import AlignParams, auto_align_and_crop
-                except ImportError as e:  # pragma: no cover
-                    raise RuntimeError(
-                        "Stereo auto-alignment requires OpenCV. Install opencv-python "
-                        "(or opencv-python-headless), or omit --align-crop."
-                    ) from e
+            if render_timing:
+                with render_timing.timed_cpu("render_output_encode"):
+                    if align_crop:
+                        # Import lazily so OpenCV isn't required unless --align-crop is used.
+                        try:
+                            from sharp.utils.stereo_align import AlignParams, auto_align_and_crop
+                        except ImportError as e:  # pragma: no cover
+                            raise RuntimeError(
+                                "Stereo auto-alignment requires OpenCV. Install opencv-python "
+                                "(or opencv-python-headless), or omit --align-crop."
+                            ) from e
 
-                # Auto-align + auto-crop the stereo pair, then re-pack SBS for output.
-                align_params = AlignParams()
-                color_l_np, color_r_np, _meta = auto_align_and_crop(
-                    color_l_np, color_r_np, params=align_params
-                )
+                        # Auto-align + auto-crop the stereo pair, then re-pack SBS for output.
+                        align_params = AlignParams()
+                        color_l_np, color_r_np, _meta = auto_align_and_crop(
+                            color_l_np, color_r_np, params=align_params
+                        )
 
-            color_sbs_np = np.concatenate((color_l_np, color_r_np), axis=1)
-            img = Image.fromarray(color_sbs_np, mode="RGB")
-            sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
-            img.save(sbs_image_path)
+                    color_sbs_np = np.concatenate((color_l_np, color_r_np), axis=1)
+                    img = Image.fromarray(color_sbs_np, mode="RGB")
+                    sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
+                    img.save(sbs_image_path)
+            else:
+                if align_crop:
+                    try:
+                        from sharp.utils.stereo_align import AlignParams, auto_align_and_crop
+                    except ImportError as e:  # pragma: no cover
+                        raise RuntimeError(
+                            "Stereo auto-alignment requires OpenCV. Install opencv-python "
+                            "(or opencv-python-headless), or omit --align-crop."
+                        ) from e
+
+                    align_params = AlignParams()
+                    color_l_np, color_r_np, _meta = auto_align_and_crop(
+                        color_l_np, color_r_np, params=align_params
+                    )
+
+                color_sbs_np = np.concatenate((color_l_np, color_r_np), axis=1)
+                img = Image.fromarray(color_sbs_np, mode="RGB")
+                sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
+                img.save(sbs_image_path)
+            if render_timing:
+                render_timing.finalize_frame()
             break
 
         # Only add to video if video writer was created
         if video_writer is not None:
             depth = torch.cat((depth_l, depth_r), dim=0)
-            video_writer.add_frame(color, depth)
+            if render_timing:
+                video_writer.add_frame(color, depth, render_timing=render_timing)
+            else:
+                video_writer.add_frame(color, depth)
+        if render_timing:
+            render_timing.finalize_frame()
 
     # Only close video writer if it was created
     if video_writer is not None:
@@ -222,74 +311,161 @@ def render_gaussians_pred_space(
         gaussians_camera_sample, params, resolution_px=metadata.resolution_px, f_px=f_px
     )
     renderer = gsplat.GSplatRenderer(color_space=metadata.color_space)
+    render_timing = metrics.render_timing if metrics else None
 
     video_writer = io.VideoWriter(output_path) if sbs_image_path is None else None
 
     for frame_idx, eye_mid in enumerate(trajectory):
         if metrics:
             metrics.inc("render_frames")
-        eye_position_l = eye_mid.clone()
-        eye_position_l[0] -= baseline * 0.5
-        eye_position_r = eye_mid.clone()
-        eye_position_r[0] += baseline * 0.5
+        # Stage mapping: setup = camera pose prep, pack_inputs = assemble tensors,
+        # h2d_transfer = device copies, gpu_* = renderer/GPU post, d2h/output = readback + encode.
+        if render_timing:
+            render_timing.start_frame()
+        if render_timing:
+            with render_timing.timed_cpu("render_setup"):
+                eye_position_l = eye_mid.clone()
+                eye_position_l[0] -= baseline * 0.5
+                eye_position_r = eye_mid.clone()
+                eye_position_r[0] += baseline * 0.5
+                camera_info_l = camera_model.compute(eye_position_l)
+                camera_info_r = camera_model.compute(eye_position_r)
+        else:
+            eye_position_l = eye_mid.clone()
+            eye_position_l[0] -= baseline * 0.5
+            eye_position_r = eye_mid.clone()
+            eye_position_r[0] += baseline * 0.5
+            camera_info_l = camera_model.compute(eye_position_l)
+            camera_info_r = camera_model.compute(eye_position_r)
 
-        camera_info = camera_model.compute(eye_position_l)
-        extrinsics_l = camera_info.extrinsics.to(device) @ u_pred_to_world
-        rendering_output = renderer(
-            gaussians.to(device),
+        if render_timing:
+            with render_timing.timed_cpu("render_pack_inputs"):
+                extrinsics_l = camera_info_l.extrinsics
+                intrinsics_l = camera_info_l.intrinsics[None]
+                extrinsics_r = camera_info_r.extrinsics
+                intrinsics_r = camera_info_r.intrinsics[None]
+        else:
+            extrinsics_l = camera_info_l.extrinsics
+            intrinsics_l = camera_info_l.intrinsics[None]
+            extrinsics_r = camera_info_r.extrinsics
+            intrinsics_r = camera_info_r.intrinsics[None]
+
+        if render_timing:
+            with render_timing.timed_cpu("render_h2d_transfer"):
+                gaussians_l = gaussians.to(device)
+                extrinsics_l = extrinsics_l.to(device) @ u_pred_to_world
+                intrinsics_l = intrinsics_l.to(device)
+                gaussians_r = gaussians.to(device)
+                extrinsics_r = extrinsics_r.to(device) @ u_pred_to_world
+                intrinsics_r = intrinsics_r.to(device)
+        else:
+            gaussians_l = gaussians.to(device)
+            extrinsics_l = extrinsics_l.to(device) @ u_pred_to_world
+            intrinsics_l = intrinsics_l.to(device)
+            gaussians_r = gaussians.to(device)
+            extrinsics_r = extrinsics_r.to(device) @ u_pred_to_world
+            intrinsics_r = intrinsics_r.to(device)
+
+        rendering_output_l = renderer(
+            gaussians_l,
             extrinsics=extrinsics_l[None],
-            intrinsics=camera_info.intrinsics[None].to(device),
-            image_width=camera_info.width,
-            image_height=camera_info.height,
+            intrinsics=intrinsics_l,
+            image_width=camera_info_l.width,
+            image_height=camera_info_l.height,
+            render_timing=render_timing,
         )
-        color_l = (rendering_output.color[0].permute(1, 2, 0) * 255.0).to(
-            dtype=torch.uint8
-        )
-        depth_l = rendering_output.depth[0]
 
-        camera_info = camera_model.compute(eye_position_r)
-        extrinsics_r = camera_info.extrinsics.to(device) @ u_pred_to_world
-        rendering_output = renderer(
-            gaussians.to(device),
+        rendering_output_r = renderer(
+            gaussians_r,
             extrinsics=extrinsics_r[None],
-            intrinsics=camera_info.intrinsics[None].to(device),
-            image_width=camera_info.width,
-            image_height=camera_info.height,
+            intrinsics=intrinsics_r,
+            image_width=camera_info_r.width,
+            image_height=camera_info_r.height,
+            render_timing=render_timing,
         )
-        color_r = (rendering_output.color[0].permute(1, 2, 0) * 255.0).to(
-            dtype=torch.uint8
-        )
-        depth_r = rendering_output.depth[0]
 
-        color = torch.cat((color_l, color_r), dim=1)
+        if render_timing:
+            with render_timing.gpu_event_timer("render_gpu_raster_blend"):
+                color_l = (rendering_output_l.color[0].permute(1, 2, 0) * 255.0).to(
+                    dtype=torch.uint8
+                )
+                depth_l = rendering_output_l.depth[0]
+                color_r = (rendering_output_r.color[0].permute(1, 2, 0) * 255.0).to(
+                    dtype=torch.uint8
+                )
+                depth_r = rendering_output_r.depth[0]
+                color = torch.cat((color_l, color_r), dim=1)
+        else:
+            color_l = (rendering_output_l.color[0].permute(1, 2, 0) * 255.0).to(
+                dtype=torch.uint8
+            )
+            depth_l = rendering_output_l.depth[0]
+            color_r = (rendering_output_r.color[0].permute(1, 2, 0) * 255.0).to(
+                dtype=torch.uint8
+            )
+            depth_r = rendering_output_r.depth[0]
+            color = torch.cat((color_l, color_r), dim=1)
 
         if sbs_image_path is not None and frame_idx == sbs_image_frame:
-            color_l_np = color_l.detach().cpu().numpy()
-            color_r_np = color_r.detach().cpu().numpy()
+            if render_timing:
+                with render_timing.timed_cpu("render_d2h_transfer"):
+                    color_l_np = color_l.detach().cpu().numpy()
+                    color_r_np = color_r.detach().cpu().numpy()
+            else:
+                color_l_np = color_l.detach().cpu().numpy()
+                color_r_np = color_r.detach().cpu().numpy()
 
-            if align_crop:
-                try:
-                    from sharp.utils.stereo_align import AlignParams, auto_align_and_crop
-                except ImportError as e:  # pragma: no cover
-                    raise RuntimeError(
-                        "Stereo auto-alignment requires OpenCV. Install opencv-python "
-                        "(or opencv-python-headless), or omit --align-crop."
-                    ) from e
+            if render_timing:
+                with render_timing.timed_cpu("render_output_encode"):
+                    if align_crop:
+                        try:
+                            from sharp.utils.stereo_align import AlignParams, auto_align_and_crop
+                        except ImportError as e:  # pragma: no cover
+                            raise RuntimeError(
+                                "Stereo auto-alignment requires OpenCV. Install opencv-python "
+                                "(or opencv-python-headless), or omit --align-crop."
+                            ) from e
 
-                align_params = AlignParams()
-                color_l_np, color_r_np, _meta = auto_align_and_crop(
-                    color_l_np, color_r_np, params=align_params
-                )
+                        align_params = AlignParams()
+                        color_l_np, color_r_np, _meta = auto_align_and_crop(
+                            color_l_np, color_r_np, params=align_params
+                        )
 
-            color_sbs_np = np.concatenate((color_l_np, color_r_np), axis=1)
-            img = Image.fromarray(color_sbs_np, mode="RGB")
-            sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
-            img.save(sbs_image_path)
+                    color_sbs_np = np.concatenate((color_l_np, color_r_np), axis=1)
+                    img = Image.fromarray(color_sbs_np, mode="RGB")
+                    sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
+                    img.save(sbs_image_path)
+            else:
+                if align_crop:
+                    try:
+                        from sharp.utils.stereo_align import AlignParams, auto_align_and_crop
+                    except ImportError as e:  # pragma: no cover
+                        raise RuntimeError(
+                            "Stereo auto-alignment requires OpenCV. Install opencv-python "
+                            "(or opencv-python-headless), or omit --align-crop."
+                        ) from e
+
+                    align_params = AlignParams()
+                    color_l_np, color_r_np, _meta = auto_align_and_crop(
+                        color_l_np, color_r_np, params=align_params
+                    )
+
+                color_sbs_np = np.concatenate((color_l_np, color_r_np), axis=1)
+                img = Image.fromarray(color_sbs_np, mode="RGB")
+                sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
+                img.save(sbs_image_path)
+            if render_timing:
+                render_timing.finalize_frame()
             break
 
         if video_writer is not None:
             depth = torch.cat((depth_l, depth_r), dim=0)
-            video_writer.add_frame(color, depth)
+            if render_timing:
+                video_writer.add_frame(color, depth, render_timing=render_timing)
+            else:
+                video_writer.add_frame(color, depth)
+        if render_timing:
+            render_timing.finalize_frame()
 
     if video_writer is not None:
         video_writer.close()

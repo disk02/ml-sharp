@@ -17,6 +17,7 @@ import pillow_heif
 import torch
 from PIL import ExifTags, Image, TiffTags
 
+from .metrics import RenderTiming
 from .vis import METRIC_DEPTH_MAX_CLAMP_METER, colorize_depth
 
 LOGGER = logging.getLogger(__name__)
@@ -170,7 +171,9 @@ def get_supported_video_extensions():
 class OutputWriter(Protocol):
     """Protocol for writing output to disk."""
 
-    def add_frame(self, image: torch.Tensor, depth: torch.Tensor) -> None:
+    def add_frame(
+        self, image: torch.Tensor, depth: torch.Tensor, render_timing: RenderTiming | None = None
+    ) -> None:
         """Add a single frame to output."""
         ...
 
@@ -192,21 +195,43 @@ class VideoWriter(OutputWriter):
         if render_depth:
             self.depth_writer = iio.get_writer(output_path.with_suffix(".depth.mp4"), fps=fps)
 
-    def add_frame(self, image: torch.Tensor, depth: torch.Tensor) -> None:
+    def add_frame(
+        self, image: torch.Tensor, depth: torch.Tensor, render_timing: RenderTiming | None = None
+    ) -> None:
         """Add a single frame to output."""
-        image_np = image.detach().cpu().numpy()
-        self.image_writer.append_data(image_np)
+        if render_timing is None:
+            image_np = image.detach().cpu().numpy()
+            self.image_writer.append_data(image_np)
 
-        if self.depth_writer is not None:
-            if self.max_depth_estimate is None:
-                self.max_depth_estimate = depth.max().item()
+            if self.depth_writer is not None:
+                if self.max_depth_estimate is None:
+                    self.max_depth_estimate = depth.max().item()
 
-            colored_depth_pt = colorize_depth(
-                depth,
-                min(self.max_depth_estimate, METRIC_DEPTH_MAX_CLAMP_METER),  # type: ignore[call-overload]
-            )
-            colored_depth_np = colored_depth_pt.squeeze(0).permute(1, 2, 0).cpu().numpy()
-            self.depth_writer.append_data(colored_depth_np)
+                colored_depth_pt = colorize_depth(
+                    depth,
+                    min(self.max_depth_estimate, METRIC_DEPTH_MAX_CLAMP_METER),  # type: ignore[call-overload]
+                )
+                colored_depth_np = colored_depth_pt.squeeze(0).permute(1, 2, 0).cpu().numpy()
+                self.depth_writer.append_data(colored_depth_np)
+            return
+
+        with render_timing.timed_cpu("render_d2h_transfer"):
+            image_np = image.detach().cpu().numpy()
+            depth_cpu = depth.detach().cpu()
+
+        with render_timing.timed_cpu("render_output_encode"):
+            self.image_writer.append_data(image_np)
+
+            if self.depth_writer is not None:
+                if self.max_depth_estimate is None:
+                    self.max_depth_estimate = depth_cpu.max().item()
+
+                colored_depth_pt = colorize_depth(
+                    depth_cpu,
+                    min(self.max_depth_estimate, METRIC_DEPTH_MAX_CLAMP_METER),  # type: ignore[call-overload]
+                )
+                colored_depth_np = colored_depth_pt.squeeze(0).permute(1, 2, 0).cpu().numpy()
+                self.depth_writer.append_data(colored_depth_np)
 
     def close(self):
         """Finish writing."""

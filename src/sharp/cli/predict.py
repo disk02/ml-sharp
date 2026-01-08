@@ -32,7 +32,7 @@ from sharp.utils.gaussians import (
     save_ply,
     unproject_gaussians,
 )
-from sharp.utils.metrics import Metrics
+from sharp.utils.metrics import Metrics, RenderTiming
 
 from sharp.rendering.gaussian_renderer import (
     render_gaussians,
@@ -327,6 +327,8 @@ def predict_cli(
         effective_save_ply = True
     else:
         effective_save_ply = bool(save_ply)
+    if want_video or want_sbs_image or fast_preview_render or fast_preview_compare:
+        metrics.render_timing = RenderTiming()
 
     run_start = perf_counter()
     for index, image_path in enumerate(image_paths, start=1):
@@ -748,6 +750,33 @@ def _log_metrics_summary(metrics: Metrics) -> None:
             f"{stats['total']:>10.4f}"
         )
     LOGGER.info("Timing summary (seconds):\n%s", "\n".join(lines))
+
+    render_timing = metrics.render_timing
+    if render_timing is not None:
+        render_summary = render_timing.summarize()
+        if render_summary:
+            render_total = summary.get("render_total", {}).get("total", 0.0)
+            header = (
+                f"{'Stage':<30} {'mean(s)':>10} {'p50(s)':>10} {'p90(s)':>10} "
+                f"{'total(s)':>10} {'%render':>10}"
+            )
+            lines = [header]
+            for name in RenderTiming.stage_order + ["render_total_breakdown"]:
+                stats = render_summary.get(name)
+                if stats is None:
+                    continue
+                percent = (stats["total"] / render_total * 100.0) if render_total > 0 else 0.0
+                lines.append(
+                    f"{name:<30} "
+                    f"{stats['mean']:>10.4f} "
+                    f"{stats['p50']:>10.4f} "
+                    f"{stats['p90']:>10.4f} "
+                    f"{stats['total']:>10.4f} "
+                    f"{percent:>10.2f}"
+                )
+            LOGGER.info(
+                "Timing summary - render_total breakdown (seconds):\n%s", "\n".join(lines)
+            )
 
     counter_order = [
         "cov_nonfinite",
