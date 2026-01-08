@@ -590,9 +590,10 @@ def preprocess_one(
     f_px: float,
     device: torch.device,
     *,
-    target_resolution: tuple[int, int],
+    target_size_wh: tuple[int, int],
     dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor, dict]:
+    target_w, target_h = target_size_wh
     image_pt = (
         torch.from_numpy(image_np.copy()).to(dtype=dtype, device=device).permute(2, 0, 1)
         / 255.0
@@ -601,10 +602,11 @@ def preprocess_one(
     disparity_factor_pt = torch.tensor([f_px / width], dtype=dtype, device=device)
     image_resized_pt = F.interpolate(
         image_pt[None],
-        size=(target_resolution[1], target_resolution[0]),
+        size=(target_h, target_w),
         mode="bilinear",
         align_corners=True,
     )
+    # target_size_wh is (W, H); interpolate expects (H, W).
     # image_resized_pt: (B, C, H, W) with B=1 for now.
     if __debug__:
         assert image_resized_pt.ndim == 4
@@ -615,7 +617,8 @@ def preprocess_one(
         "height": height,
         "width": width,
         "f_px": f_px,
-        "internal_shape": target_resolution,
+        "target_w": target_w,
+        "target_h": target_h,
     }
     return image_resized_pt, disparity_factor_pt, aux
 
@@ -628,6 +631,7 @@ def model_forward_batch(
     amp_dtype: torch.dtype | None,
 ) -> Any:
     with torch.inference_mode():
+        # CUDA uses autocast when amp_dtype is set; CPU/MPS run without autocast.
         if image_resized_pt.device.type == "cuda":
             with torch.autocast(
                 device_type="cuda", dtype=amp_dtype, enabled=amp_dtype is not None
@@ -637,20 +641,14 @@ def model_forward_batch(
 
 
 def postprocess_one(
-    gaussians_ndc_one: Any,
+    gaussians_ndc_one: Gaussians3D,
     aux: dict,
     *,
     return_world: bool,
     return_unprojection: bool,
     device: torch.device,
 ) -> PredictionResult:
-    gaussians_ndc = Gaussians3D(
-        mean_vectors=gaussians_ndc_one.mean_vectors.float(),
-        singular_values=gaussians_ndc_one.singular_values.float(),
-        quaternions=gaussians_ndc_one.quaternions.float(),
-        colors=gaussians_ndc_one.colors.float(),
-        opacities=gaussians_ndc_one.opacities.float(),
-    )
+    gaussians_ndc = gaussians_ndc_one
     quaternions = gaussians_ndc.quaternions
     quat_norm = quaternions.norm(dim=-1, keepdim=True)
     quat_valid = torch.isfinite(quat_norm) & (quat_norm > 1e-8)
@@ -685,7 +683,8 @@ def postprocess_one(
         height = aux["height"]
         width = aux["width"]
         f_px = aux["f_px"]
-        internal_shape = aux["internal_shape"]
+        target_w = aux["target_w"]
+        target_h = aux["target_h"]
         intrinsics = (
             torch.tensor(
                 [
@@ -699,23 +698,23 @@ def postprocess_one(
             .to(device)
         )
         intrinsics_resized = intrinsics.clone()
-        intrinsics_resized[0] *= internal_shape[0] / width
-        intrinsics_resized[1] *= internal_shape[1] / height
+        intrinsics_resized[0] *= target_w / width
+        intrinsics_resized[1] *= target_h / height
         unprojection_context = UnprojectionContext(
             intrinsics_resized=intrinsics_resized,
-            internal_shape=internal_shape,
+            internal_shape=(target_w, target_h),
             device=device,
         )
         if return_unprojection:
             unprojection_matrix = get_unprojection_matrix(
-                torch.eye(4).to(device), intrinsics_resized, internal_shape
+                torch.eye(4).to(device), intrinsics_resized, (target_w, target_h)
             )
         if return_world:
             gaussians_world = unproject_gaussians(
                 gaussians_ndc,
                 torch.eye(4).to(device),
                 intrinsics_resized,
-                internal_shape,
+                (target_w, target_h),
                 metrics=aux.get("metrics"),
             )
 
@@ -748,7 +747,7 @@ def predict_image(
         image,
         f_px,
         device,
-        target_resolution=internal_shape,
+        target_size_wh=internal_shape,
         dtype=torch.float32,
     )
     aux["metrics"] = metrics
@@ -774,11 +773,11 @@ def predict_image(
     LOGGER.info("Running postprocessing.")
     postprocess_start = perf_counter() if metrics else None
     gaussians_ndc_one = Gaussians3D(
-        mean_vectors=gaussians_ndc_batch.mean_vectors[0],
-        singular_values=gaussians_ndc_batch.singular_values[0],
-        quaternions=gaussians_ndc_batch.quaternions[0],
-        colors=gaussians_ndc_batch.colors[0],
-        opacities=gaussians_ndc_batch.opacities[0],
+        mean_vectors=gaussians_ndc_batch.mean_vectors[0].float(),
+        singular_values=gaussians_ndc_batch.singular_values[0].float(),
+        quaternions=gaussians_ndc_batch.quaternions[0].float(),
+        colors=gaussians_ndc_batch.colors[0].float(),
+        opacities=gaussians_ndc_batch.opacities[0].float(),
     )
     prediction = postprocess_one(
         gaussians_ndc_one,
