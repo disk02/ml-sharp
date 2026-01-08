@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io as py_io
 from pathlib import Path
 
 import numpy as np
@@ -177,7 +178,7 @@ def render_gaussians(
                 color_r_np = color_r.detach().cpu().numpy()
 
             if render_timing:
-                with render_timing.timed_cpu("render_output_encode"):
+                with render_timing.timed_cpu("render_encode_prepare"):
                     if align_crop:
                         # Import lazily so OpenCV isn't required unless --align-crop is used.
                         try:
@@ -197,7 +198,17 @@ def render_gaussians(
                     color_sbs_np = np.concatenate((color_l_np, color_r_np), axis=1)
                     img = Image.fromarray(color_sbs_np, mode="RGB")
                     sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
-                    img.save(sbs_image_path)
+                img_format = Image.registered_extensions().get(sbs_image_path.suffix.lower())
+                if img_format is None:
+                    with render_timing.timed_cpu("render_encode_write"):
+                        img.save(sbs_image_path)
+                else:
+                    with render_timing.timed_cpu("render_encode_compress"):
+                        bytes_io = py_io.BytesIO()
+                        img.save(bytes_io, format=img_format)
+                    with render_timing.timed_cpu("render_encode_write"):
+                        with sbs_image_path.open("wb") as file_handle:
+                            file_handle.write(bytes_io.getvalue())
             else:
                 if align_crop:
                     try:
@@ -416,7 +427,7 @@ def render_gaussians_pred_space(
                 color_r_np = color_r.detach().cpu().numpy()
 
             if render_timing:
-                with render_timing.timed_cpu("render_output_encode"):
+                with render_timing.timed_cpu("render_encode_prepare"):
                     if align_crop:
                         try:
                             from sharp.utils.stereo_align import AlignParams, auto_align_and_crop
@@ -434,7 +445,17 @@ def render_gaussians_pred_space(
                     color_sbs_np = np.concatenate((color_l_np, color_r_np), axis=1)
                     img = Image.fromarray(color_sbs_np, mode="RGB")
                     sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
-                    img.save(sbs_image_path)
+                img_format = Image.registered_extensions().get(sbs_image_path.suffix.lower())
+                if img_format is None:
+                    with render_timing.timed_cpu("render_encode_write"):
+                        img.save(sbs_image_path)
+                else:
+                    with render_timing.timed_cpu("render_encode_compress"):
+                        bytes_io = py_io.BytesIO()
+                        img.save(bytes_io, format=img_format)
+                    with render_timing.timed_cpu("render_encode_write"):
+                        with sbs_image_path.open("wb") as file_handle:
+                            file_handle.write(bytes_io.getvalue())
             else:
                 if align_crop:
                     try:

@@ -219,9 +219,7 @@ class VideoWriter(OutputWriter):
             image_np = image.detach().cpu().numpy()
             depth_cpu = depth.detach().cpu()
 
-        with render_timing.timed_cpu("render_output_encode"):
-            self.image_writer.append_data(image_np)
-
+        with render_timing.timed_cpu("render_encode_prepare"):
             if self.depth_writer is not None:
                 if self.max_depth_estimate is None:
                     self.max_depth_estimate = depth_cpu.max().item()
@@ -231,6 +229,12 @@ class VideoWriter(OutputWriter):
                     min(self.max_depth_estimate, METRIC_DEPTH_MAX_CLAMP_METER),  # type: ignore[call-overload]
                 )
                 colored_depth_np = colored_depth_pt.squeeze(0).permute(1, 2, 0).cpu().numpy()
+            else:
+                colored_depth_np = None
+
+        with render_timing.timed_cpu("render_encode_write"):
+            self.image_writer.append_data(image_np)
+            if self.depth_writer is not None and colored_depth_np is not None:
                 self.depth_writer.append_data(colored_depth_np)
 
     def close(self):

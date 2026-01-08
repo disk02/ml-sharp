@@ -62,8 +62,16 @@ class RenderTiming:
         "render_gpu_shading",
         "render_gpu_raster_blend",
         "render_d2h_transfer",
+        "render_encode_prepare",
+        "render_encode_compress",
+        "render_encode_write",
         "render_output_encode",
         "render_sync_overhead",
+    ]
+    encode_stages = [
+        "render_encode_prepare",
+        "render_encode_compress",
+        "render_encode_write",
     ]
     gpu_stages = {
         "render_gpu_project_sort",
@@ -132,9 +140,19 @@ class RenderTiming:
         if sync_overhead > 0.0:
             self._current_frame["render_sync_overhead"] += sync_overhead
 
-        for stage in self.stage_order:
+        encode_total = sum(self._current_frame.get(stage, 0.0) for stage in self.encode_stages)
+        if self._current_frame.get("render_output_encode", 0.0) == 0.0 and encode_total > 0.0:
+            self._current_frame["render_output_encode"] = encode_total
+
+        for stage in set(self.stage_order) | set(self._current_frame):
             self.timings.setdefault(stage, []).append(self._current_frame.get(stage, 0.0))
-        total_breakdown = sum(self._current_frame.values())
+
+        total_stage_order = [
+            stage
+            for stage in self.stage_order
+            if stage not in self.encode_stages and stage != "render_output_encode"
+        ] + ["render_output_encode"]
+        total_breakdown = sum(self._current_frame.get(stage, 0.0) for stage in total_stage_order)
         self.timings.setdefault("render_total_breakdown", []).append(total_breakdown)
         self._current_frame = None
 
