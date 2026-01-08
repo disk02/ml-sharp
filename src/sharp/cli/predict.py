@@ -595,6 +595,8 @@ def preprocess_one(
 ) -> tuple[torch.Tensor, torch.Tensor, dict]:
     target_w, target_h = target_size_wh
     image_np = np.ascontiguousarray(image_np)
+    if not image_np.flags.writeable:
+        image_np = image_np.copy()
     image_pt = torch.from_numpy(image_np).to(dtype=dtype, device=device).permute(2, 0, 1)
     image_pt = image_pt / 255.0
     _, height, width = image_pt.shape
@@ -623,13 +625,14 @@ def preprocess_one(
 
 
 def _slice_gaussians(gaussians: Gaussians3D, idx: int) -> Gaussians3D:
-    """Return a view of a single batch element without copying."""
+    """Return a view of a single batch element while preserving the batch dim."""
+    sl = slice(idx, idx + 1)
     return Gaussians3D(
-        mean_vectors=gaussians.mean_vectors[idx],
-        singular_values=gaussians.singular_values[idx],
-        quaternions=gaussians.quaternions[idx],
-        colors=gaussians.colors[idx],
-        opacities=gaussians.opacities[idx],
+        mean_vectors=gaussians.mean_vectors[sl],
+        singular_values=gaussians.singular_values[sl],
+        quaternions=gaussians.quaternions[sl],
+        colors=gaussians.colors[sl],
+        opacities=gaussians.opacities[sl],
     )
 
 
