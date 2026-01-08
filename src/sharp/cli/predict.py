@@ -608,7 +608,7 @@ def predict_cli(
                 f_px,
                 torch.device(device),
                 amp_enabled=amp,
-                amp_dtype=amp_autocast_dtype,
+                amp_dtype=amp_dtype_to_use,
                 metrics=metrics,
                 return_world=want_world_for_predict,
                 return_unprojection=fast_preview_render,
