@@ -10,7 +10,7 @@ import logging
 from time import perf_counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import click
 import numpy as np
@@ -620,22 +620,18 @@ def preprocess_one(
     return image_resized_pt, disparity_factor_pt, aux
 
 
-@torch.no_grad()
 def model_forward_batch(
     predictor: torch.nn.Module,
     image_resized_pt: torch.Tensor,
     disparity_factor_pt: torch.Tensor,
     *,
-    amp: bool,
+    amp_dtype: torch.dtype | None,
 ) -> Any:
-    autocast_dtype = image_resized_pt.dtype
-    if amp and image_resized_pt.device.type == "cuda":
-        get_dtype = getattr(torch, "get_autocast_gpu_dtype", None)
-        if callable(get_dtype):
-            autocast_dtype = get_dtype()
     with torch.inference_mode():
-        if amp and image_resized_pt.device.type == "cuda":
-            with torch.autocast(device_type="cuda", dtype=autocast_dtype):
+        if image_resized_pt.device.type == "cuda":
+            with torch.autocast(
+                device_type="cuda", dtype=amp_dtype, enabled=amp_dtype is not None
+            ):
                 return predictor(image_resized_pt, disparity_factor_pt)
         return predictor(image_resized_pt, disparity_factor_pt)
 
@@ -693,8 +689,8 @@ def postprocess_one(
         intrinsics = (
             torch.tensor(
                 [
-                    [f_px, 0, width / 2, 0],
-                    [0, f_px, height / 2, 0],
+                    [f_px, 0, (width - 1) / 2.0, 0],
+                    [0, f_px, (height - 1) / 2.0, 0],
                     [0, 0, 1, 0],
                     [0, 0, 0, 1],
                 ]
@@ -761,23 +757,17 @@ def predict_image(
 
     LOGGER.info("Running inference.")
     forward_start = perf_counter() if metrics else None
-    prev_autocast_dtype = None
+    amp_dtype_to_use: torch.dtype | None = None
     if amp_enabled and device.type == "cuda":
-        get_dtype = getattr(torch, "get_autocast_gpu_dtype", None)
-        set_dtype = getattr(torch, "set_autocast_gpu_dtype", None)
-        if callable(get_dtype) and callable(set_dtype):
-            prev_autocast_dtype = get_dtype()
-            set_dtype(amp_dtype)
+        amp_dtype_to_use = amp_dtype
+        if amp_dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+            amp_dtype_to_use = torch.float16
     gaussians_ndc_batch = model_forward_batch(
         predictor,
         image_resized_pt,
         disparity_factor,
-        amp=amp_enabled,
+        amp_dtype=amp_dtype_to_use,
     )
-    if prev_autocast_dtype is not None:
-        set_dtype = getattr(torch, "set_autocast_gpu_dtype", None)
-        if callable(set_dtype):
-            set_dtype(prev_autocast_dtype)
     if metrics and forward_start is not None:
         metrics.add_time("model_forward", perf_counter() - forward_start)
 
