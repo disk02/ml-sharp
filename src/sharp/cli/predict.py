@@ -141,9 +141,29 @@ def _align_for_compare(
     show_default=False,
     help=(
         "Optional path to save a single SBS frame image (PNG/JPG). "
-        "If provided without a value, saves to <output-path>/<image_stem>_sbs.png. "
-        "If a directory path is provided, saves <dir>/<image_stem>_sbs.png."
+        "If provided without a value, saves to <output-path>/<image_stem>_sbs.jpg. "
+        "If a directory path is provided, saves <dir>/<image_stem>_sbs.jpg."
     ),
+)
+@click.option(
+    "--sbs-format",
+    type=click.Choice(["jpg", "png"], case_sensitive=False),
+    default=None,
+    show_default=False,
+    help="SBS image format when using --sbs-image (jpg or png).",
+)
+@click.option(
+    "--sbs-jpeg-quality",
+    type=click.IntRange(1, 100),
+    default=90,
+    show_default=True,
+    help="JPEG quality (1-100) for --sbs-format=jpg.",
+)
+@click.option(
+    "--png-format",
+    is_flag=True,
+    default=False,
+    help="Select legacy PNG output for --sbs-image (equivalent to --sbs-format=png).",
 )
 @click.option(
     "--sbs-image-frame",
@@ -222,6 +242,9 @@ def predict_cli(
     checkpoint_path: Path,
     with_rendering: bool,
     sbs_image: Path | None,
+    sbs_format: str | None,
+    sbs_jpeg_quality: int,
+    png_format: bool,
     sbs_image_frame: int,
     fast_preview_render: bool,
     align_crop: bool,
@@ -310,6 +333,25 @@ def predict_cli(
 
     want_sbs_image = sbs_image is not None
     want_video = with_rendering
+    if not want_sbs_image and (sbs_format is not None or png_format):
+        LOGGER.warning("--sbs-format/--png-format ignored because --sbs-image was not set.")
+    effective_sbs_format = None
+    if want_sbs_image:
+        if sbs_format is None:
+            if png_format:
+                effective_sbs_format = "png"
+            else:
+                effective_sbs_format = "jpg"
+        else:
+            if png_format:
+                LOGGER.warning("--png-format ignored because --sbs-format was provided.")
+            effective_sbs_format = sbs_format.lower()
+        if png_format and effective_sbs_format == "png":
+            LOGGER.info("Using legacy PNG output via --png-format.")
+        if effective_sbs_format == "jpg":
+            LOGGER.info("SBS image format: jpg (quality %d).", sbs_jpeg_quality)
+        elif effective_sbs_format == "png":
+            LOGGER.info("SBS image format: png.")
     if fast_preview_render and not want_sbs_image:
         LOGGER.warning("--fast-preview-render is only used with --sbs-image. Disabling.")
         fast_preview_render = False
@@ -393,10 +435,11 @@ def predict_cli(
         # Determine SBS image output path (optional)
         sbs_image_path: Path | None = None
         if want_sbs_image:
+            desired_suffix = ".png" if effective_sbs_format == "png" else ".jpg"
             sbs_out = Path(sbs_image)
             # Support `--sbs-image` with no value: default to output directory
             if sbs_out.name == "__AUTO__":
-                sbs_image_path = out_dir / f"{image_path.stem}_sbs.png"
+                sbs_image_path = out_dir / f"{image_path.stem}_sbs{desired_suffix}"
             else:
                 # If a directory path is provided (no suffix), place an image per input
                 if sbs_out.suffix == "":
@@ -404,16 +447,16 @@ def predict_cli(
                     if input_is_dir:
                         sbs_base = sbs_out / rel_path.parent
                         sbs_base.mkdir(parents=True, exist_ok=True)
-                    sbs_image_path = sbs_base / f"{image_path.stem}_sbs.png"
+                    sbs_image_path = sbs_base / f"{image_path.stem}_sbs{desired_suffix}"
                 else:
                     # If multiple inputs are processed and a single file path is given, avoid overwrites
                     if len(image_paths) > 1:
                         rel_stem = "_".join(rel_path.with_suffix("").parts)
                         sbs_image_path = sbs_out.with_name(
-                            f"{sbs_out.stem}_{rel_stem}{sbs_out.suffix}"
+                            f"{sbs_out.stem}_{rel_stem}{desired_suffix}"
                         )
                     else:
-                        sbs_image_path = sbs_out
+                        sbs_image_path = sbs_out.with_suffix(desired_suffix)
             if sbs_image_path is not None:
                 sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -450,6 +493,8 @@ def predict_cli(
                         metadata=metadata,
                         output_path=output_video_path,
                         sbs_image_path=baseline_path,
+                        sbs_image_format=effective_sbs_format,
+                        sbs_jpeg_quality=sbs_jpeg_quality,
                         sbs_image_frame=sbs_image_frame,
                         align_crop=align_crop,
                         metrics=metrics,
@@ -460,6 +505,8 @@ def predict_cli(
                     output_path=output_video_path,
                     unprojection_matrix=prediction.unprojection_matrix,
                     sbs_image_path=sbs_image_path,
+                    sbs_image_format=effective_sbs_format,
+                    sbs_jpeg_quality=sbs_jpeg_quality,
                     sbs_image_frame=sbs_image_frame,
                     align_crop=align_crop,
                     metrics=metrics,
@@ -491,6 +538,8 @@ def predict_cli(
                     metadata=metadata,
                     output_path=output_video_path,
                     sbs_image_path=sbs_image_path,
+                    sbs_image_format=effective_sbs_format,
+                    sbs_jpeg_quality=sbs_jpeg_quality,
                     sbs_image_frame=sbs_image_frame,
                     align_crop=align_crop,
                     metrics=metrics,
