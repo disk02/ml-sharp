@@ -350,7 +350,7 @@ def predict_cli(
     metrics = Metrics()
 
     want_sbs_image = sbs_image is not None
-    want_video = with_rendering
+    want_render_trajectory = with_rendering
     if not want_sbs_image and (sbs_format is not None or png_format):
         LOGGER.warning("--sbs-format/--png-format ignored because --sbs-image was not set.")
     effective_sbs_format = None
@@ -377,7 +377,7 @@ def predict_cli(
         raise click.ClickException("--fast-preview-compare requires --sbs-image.")
     if fast_preview_compare and not fast_preview_render:
         raise click.ClickException("--fast-preview-compare requires --fast-preview-render.")
-    if fast_preview_render and want_video:
+    if fast_preview_render and want_render_trajectory:
         raise click.ClickException(
             "--fast-preview-render is only supported for --sbs-image (not --render)."
         )
@@ -387,7 +387,7 @@ def predict_cli(
         effective_save_ply = True
     else:
         effective_save_ply = bool(save_ply)
-    if want_video or want_sbs_image or fast_preview_render or fast_preview_compare:
+    if want_render_trajectory or want_sbs_image or fast_preview_render or fast_preview_compare:
         metrics.render_timing = RenderTiming()
 
     def _finalize_prediction(
@@ -431,8 +431,8 @@ def predict_cli(
             if sbs_image_path is not None:
                 sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
 
-        if want_video or sbs_image_path is not None:
-            if want_video:
+        if want_render_trajectory or sbs_image_path is not None:
+            if want_render_trajectory:
                 output_video_path = (out_dir / image_path.stem).with_suffix(".mp4")
                 LOGGER.info("Rendering trajectory to %s", output_video_path)
             else:
@@ -576,7 +576,9 @@ def predict_cli(
                 dtype=torch.float32,
             )
             want_world_for_render = (
-                want_video or (want_sbs_image and not fast_preview_render) or fast_preview_compare
+                want_render_trajectory
+                or (want_sbs_image and not fast_preview_render)
+                or fast_preview_compare
             )
             defer_export_world = defer_world_conversion_for_export or (
                 fast_preview_render and not fast_preview_compare
@@ -654,7 +656,7 @@ def predict_cli(
                     dtype=torch.float32,
                 )
                 want_world_for_render = (
-                    want_video
+                    want_render_trajectory
                     or (want_sbs_image and not fast_preview_render)
                     or fast_preview_compare
                 )
@@ -683,7 +685,6 @@ def predict_cli(
                     "Computing world-space gaussians: %s", "yes" if space == "world" else "no"
                 )
 
-                predict_start = perf_counter()
                 preprocess_start = perf_counter() if metrics else None
                 image_resized_pt, disparity_factor, aux = preprocess_one(
                     image,
@@ -693,8 +694,10 @@ def predict_cli(
                     dtype=torch.float32,
                 )
                 aux["metrics"] = metrics
+                preprocess_elapsed = 0.0
                 if metrics and preprocess_start is not None:
-                    metrics.add_time("preprocess", perf_counter() - preprocess_start)
+                    preprocess_elapsed = perf_counter() - preprocess_start
+                    metrics.add_time("preprocess", preprocess_elapsed)
                 batch_items.append(
                     {
                         "image_path": image_path,
@@ -706,7 +709,7 @@ def predict_cli(
                         "width": width,
                         "intrinsics": intrinsics,
                         "image_start": image_start,
-                        "predict_start": predict_start,
+                        "preprocess_elapsed": preprocess_elapsed,
                         "want_world_for_predict": want_world_for_predict,
                         "aux": aux,
                         "image_resized_pt": image_resized_pt,
@@ -745,8 +748,10 @@ def predict_cli(
                         "Try a smaller --batch-size."
                     ) from exc
                 raise
+            forward_elapsed = 0.0
             if metrics and forward_start is not None:
-                metrics.add_time("model_forward", perf_counter() - forward_start)
+                forward_elapsed = perf_counter() - forward_start
+                metrics.add_time("model_forward", forward_elapsed)
 
             postprocess_start = perf_counter() if metrics else None
             for batch_index, item in enumerate(batch_items):
@@ -758,9 +763,22 @@ def predict_cli(
                     return_unprojection=fast_preview_render or effective_save_ply,
                     device=torch.device(device),
                 )
-                metrics.add_time("predict_total", perf_counter() - item["predict_start"])
+                item["prediction"] = prediction
+            postprocess_elapsed = 0.0
+            if metrics and postprocess_start is not None:
+                postprocess_elapsed = perf_counter() - postprocess_start
+                metrics.add_time("postprocess", postprocess_elapsed)
+
+            batch_count = len(batch_items)
+            forward_share = forward_elapsed / batch_count if batch_count else 0.0
+            postprocess_share = postprocess_elapsed / batch_count if batch_count else 0.0
+            for item in batch_items:
+                predict_total = (
+                    item["preprocess_elapsed"] + forward_share + postprocess_share
+                )
+                metrics.add_time("predict_total", predict_total)
                 _finalize_prediction(
-                    prediction=prediction,
+                    prediction=item["prediction"],
                     image_path=item["image_path"],
                     rel_path=item["rel_path"],
                     out_dir=item["out_dir"],
@@ -771,8 +789,6 @@ def predict_cli(
                     intrinsics=item["intrinsics"],
                     image_start=item["image_start"],
                 )
-            if metrics and postprocess_start is not None:
-                metrics.add_time("postprocess", perf_counter() - postprocess_start)
     metrics.add_time("run_total", perf_counter() - run_start)
     _log_metrics_summary(metrics)
 
