@@ -113,6 +113,7 @@ def render_gaussians(
     # Use static trajectory for SBS image mode
     if sbs_image_path is not None:
         params.type = "static"
+        sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
 
     trajectory = camera.create_eye_trajectory(
         gaussians, params, resolution_px=metadata.resolution_px, f_px=f_px
@@ -201,37 +202,47 @@ def render_gaussians(
 
         if render_timing:
             with render_timing.gpu_event_timer("render_gpu_raster_blend"):
-                color_l = (rendering_output_l.color[0].permute(1, 2, 0) * 255.0).to(
-                    dtype=torch.uint8
-                )
-                color_r = (rendering_output_r.color[0].permute(1, 2, 0) * 255.0).to(
-                    dtype=torch.uint8
-                )
+                color_l = (
+                    rendering_output_l.color[0].permute(1, 2, 0).clamp(0.0, 1.0) * 255.0
+                ).to(dtype=torch.uint8)
+                color_r = (
+                    rendering_output_r.color[0].permute(1, 2, 0).clamp(0.0, 1.0) * 255.0
+                ).to(dtype=torch.uint8)
                 depth_l = rendering_output_l.depth[0] if want_depth else None
                 depth_r = rendering_output_r.depth[0] if want_depth else None
-                # Pack the left and right views into SBS format.
-                color = torch.cat((color_l, color_r), dim=1)
+                color = (
+                    torch.cat((color_l, color_r), dim=1) if video_writer is not None else None
+                )
         else:
-            color_l = (rendering_output_l.color[0].permute(1, 2, 0) * 255.0).to(
-                dtype=torch.uint8
-            )
-            color_r = (rendering_output_r.color[0].permute(1, 2, 0) * 255.0).to(
-                dtype=torch.uint8
-            )
+            color_l = (
+                rendering_output_l.color[0].permute(1, 2, 0).clamp(0.0, 1.0) * 255.0
+            ).to(dtype=torch.uint8)
+            color_r = (
+                rendering_output_r.color[0].permute(1, 2, 0).clamp(0.0, 1.0) * 255.0
+            ).to(dtype=torch.uint8)
             depth_l = rendering_output_l.depth[0] if want_depth else None
             depth_r = rendering_output_r.depth[0] if want_depth else None
-            color = torch.cat((color_l, color_r), dim=1)
+            color = torch.cat((color_l, color_r), dim=1) if video_writer is not None else None
 
         # Write SBS frame image if requested
         if sbs_image_path is not None and frame_idx == sbs_image_frame:
             if render_timing:
                 with render_timing.timed_cpu("render_d2h_transfer"):
-                    # Convert torch -> numpy (H,W,3) uint8
-                    color_l_np = color_l.detach().cpu().numpy()
-                    color_r_np = color_r.detach().cpu().numpy()
+                    height, width, _channels = color_l.shape
+                    color_sbs_u8 = torch.empty(
+                        (height, width * 2, 3), dtype=torch.uint8, device=color_l.device
+                    )
+                    color_sbs_u8[:, :width, :] = color_l
+                    color_sbs_u8[:, width:, :] = color_r
+                    color_sbs_np = color_sbs_u8.cpu().numpy()
             else:
-                color_l_np = color_l.detach().cpu().numpy()
-                color_r_np = color_r.detach().cpu().numpy()
+                height, width, _channels = color_l.shape
+                color_sbs_u8 = torch.empty(
+                    (height, width * 2, 3), dtype=torch.uint8, device=color_l.device
+                )
+                color_sbs_u8[:, :width, :] = color_l
+                color_sbs_u8[:, width:, :] = color_r
+                color_sbs_np = color_sbs_u8.cpu().numpy()
 
             if render_timing:
                 with render_timing.timed_cpu("render_encode_prepare"):
@@ -248,19 +259,20 @@ def render_gaussians(
                         # Auto-align + auto-crop the stereo pair, then re-pack SBS for output.
                         align_params = AlignParams()
                         color_l_np, color_r_np, _meta = auto_align_and_crop(
-                            color_l_np, color_r_np, params=align_params
+                            color_sbs_np[:, :width, :],
+                            color_sbs_np[:, width:, :],
+                            params=align_params,
                         )
+                        height, width, _channels = color_l_np.shape
+                        color_sbs_np = np.empty((height, width * 2, 3), dtype=np.uint8)
+                        color_sbs_np[:, :width, :] = color_l_np
+                        color_sbs_np[:, width:, :] = color_r_np
 
-                    height, width, _channels = color_l_np.shape
-                    color_sbs_np = np.empty((height, width * 2, 3), dtype=np.uint8)
-                    color_sbs_np[:, :width, :] = color_l_np
-                    color_sbs_np[:, width:, :] = color_r_np
                     img = (
                         color_sbs_np
                         if sbs_async_writer is not None
                         else Image.fromarray(color_sbs_np, mode="RGB")
                     )
-                    sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
                 _save_sbs_image(
                     img,
                     sbs_image_path,
@@ -281,19 +293,20 @@ def render_gaussians(
 
                     align_params = AlignParams()
                     color_l_np, color_r_np, _meta = auto_align_and_crop(
-                        color_l_np, color_r_np, params=align_params
+                        color_sbs_np[:, :width, :],
+                        color_sbs_np[:, width:, :],
+                        params=align_params,
                     )
+                    height, width, _channels = color_l_np.shape
+                    color_sbs_np = np.empty((height, width * 2, 3), dtype=np.uint8)
+                    color_sbs_np[:, :width, :] = color_l_np
+                    color_sbs_np[:, width:, :] = color_r_np
 
-                height, width, _channels = color_l_np.shape
-                color_sbs_np = np.empty((height, width * 2, 3), dtype=np.uint8)
-                color_sbs_np[:, :width, :] = color_l_np
-                color_sbs_np[:, width:, :] = color_r_np
                 img = (
                     color_sbs_np
                     if sbs_async_writer is not None
                     else Image.fromarray(color_sbs_np, mode="RGB")
                 )
-                sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
                 _save_sbs_image(
                     img,
                     sbs_image_path,
@@ -394,6 +407,7 @@ def render_gaussians_pred_space(
     params.num_repeats = 3
     if sbs_image_path is not None:
         params.type = "static"
+        sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
 
     trajectory = camera.create_eye_trajectory(
         gaussians_camera_sample, params, resolution_px=metadata.resolution_px, f_px=f_px
@@ -478,34 +492,46 @@ def render_gaussians_pred_space(
 
         if render_timing:
             with render_timing.gpu_event_timer("render_gpu_raster_blend"):
-                color_l = (rendering_output_l.color[0].permute(1, 2, 0) * 255.0).to(
-                    dtype=torch.uint8
-                )
-                color_r = (rendering_output_r.color[0].permute(1, 2, 0) * 255.0).to(
-                    dtype=torch.uint8
-                )
+                color_l = (
+                    rendering_output_l.color[0].permute(1, 2, 0).clamp(0.0, 1.0) * 255.0
+                ).to(dtype=torch.uint8)
+                color_r = (
+                    rendering_output_r.color[0].permute(1, 2, 0).clamp(0.0, 1.0) * 255.0
+                ).to(dtype=torch.uint8)
                 depth_l = rendering_output_l.depth[0] if want_depth else None
                 depth_r = rendering_output_r.depth[0] if want_depth else None
-                color = torch.cat((color_l, color_r), dim=1)
+                color = (
+                    torch.cat((color_l, color_r), dim=1) if video_writer is not None else None
+                )
         else:
-            color_l = (rendering_output_l.color[0].permute(1, 2, 0) * 255.0).to(
-                dtype=torch.uint8
-            )
-            color_r = (rendering_output_r.color[0].permute(1, 2, 0) * 255.0).to(
-                dtype=torch.uint8
-            )
+            color_l = (
+                rendering_output_l.color[0].permute(1, 2, 0).clamp(0.0, 1.0) * 255.0
+            ).to(dtype=torch.uint8)
+            color_r = (
+                rendering_output_r.color[0].permute(1, 2, 0).clamp(0.0, 1.0) * 255.0
+            ).to(dtype=torch.uint8)
             depth_l = rendering_output_l.depth[0] if want_depth else None
             depth_r = rendering_output_r.depth[0] if want_depth else None
-            color = torch.cat((color_l, color_r), dim=1)
+            color = torch.cat((color_l, color_r), dim=1) if video_writer is not None else None
 
         if sbs_image_path is not None and frame_idx == sbs_image_frame:
             if render_timing:
                 with render_timing.timed_cpu("render_d2h_transfer"):
-                    color_l_np = color_l.detach().cpu().numpy()
-                    color_r_np = color_r.detach().cpu().numpy()
+                    height, width, _channels = color_l.shape
+                    color_sbs_u8 = torch.empty(
+                        (height, width * 2, 3), dtype=torch.uint8, device=color_l.device
+                    )
+                    color_sbs_u8[:, :width, :] = color_l
+                    color_sbs_u8[:, width:, :] = color_r
+                    color_sbs_np = color_sbs_u8.cpu().numpy()
             else:
-                color_l_np = color_l.detach().cpu().numpy()
-                color_r_np = color_r.detach().cpu().numpy()
+                height, width, _channels = color_l.shape
+                color_sbs_u8 = torch.empty(
+                    (height, width * 2, 3), dtype=torch.uint8, device=color_l.device
+                )
+                color_sbs_u8[:, :width, :] = color_l
+                color_sbs_u8[:, width:, :] = color_r
+                color_sbs_np = color_sbs_u8.cpu().numpy()
 
             if render_timing:
                 with render_timing.timed_cpu("render_encode_prepare"):
@@ -520,19 +546,20 @@ def render_gaussians_pred_space(
 
                         align_params = AlignParams()
                         color_l_np, color_r_np, _meta = auto_align_and_crop(
-                            color_l_np, color_r_np, params=align_params
+                            color_sbs_np[:, :width, :],
+                            color_sbs_np[:, width:, :],
+                            params=align_params,
                         )
+                        height, width, _channels = color_l_np.shape
+                        color_sbs_np = np.empty((height, width * 2, 3), dtype=np.uint8)
+                        color_sbs_np[:, :width, :] = color_l_np
+                        color_sbs_np[:, width:, :] = color_r_np
 
-                    height, width, _channels = color_l_np.shape
-                    color_sbs_np = np.empty((height, width * 2, 3), dtype=np.uint8)
-                    color_sbs_np[:, :width, :] = color_l_np
-                    color_sbs_np[:, width:, :] = color_r_np
                     img = (
                         color_sbs_np
                         if sbs_async_writer is not None
                         else Image.fromarray(color_sbs_np, mode="RGB")
                     )
-                    sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
                 _save_sbs_image(
                     img,
                     sbs_image_path,
@@ -553,19 +580,20 @@ def render_gaussians_pred_space(
 
                     align_params = AlignParams()
                     color_l_np, color_r_np, _meta = auto_align_and_crop(
-                        color_l_np, color_r_np, params=align_params
+                        color_sbs_np[:, :width, :],
+                        color_sbs_np[:, width:, :],
+                        params=align_params,
                     )
+                    height, width, _channels = color_l_np.shape
+                    color_sbs_np = np.empty((height, width * 2, 3), dtype=np.uint8)
+                    color_sbs_np[:, :width, :] = color_l_np
+                    color_sbs_np[:, width:, :] = color_r_np
 
-                height, width, _channels = color_l_np.shape
-                color_sbs_np = np.empty((height, width * 2, 3), dtype=np.uint8)
-                color_sbs_np[:, :width, :] = color_l_np
-                color_sbs_np[:, width:, :] = color_r_np
                 img = (
                     color_sbs_np
                     if sbs_async_writer is not None
                     else Image.fromarray(color_sbs_np, mode="RGB")
                 )
-                sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
                 _save_sbs_image(
                     img,
                     sbs_image_path,
