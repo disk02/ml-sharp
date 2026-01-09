@@ -275,6 +275,40 @@ def _align_for_compare(
     help="Render SBS preview using predicted-space gaussians (skips world conversion).",
 )
 @click.option(
+    "--sbs-min-opacity",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help=(
+        "Minimum opacity for SBS splats. Suggested starting values: 0.005 or 0.01. "
+        "Only used with --sbs-image."
+    ),
+)
+@click.option(
+    "--sbs-min-scale",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help=(
+        "Minimum splat scale for SBS pruning (model-dependent units). Suggested starting "
+        "value: 0.001. Only used with --sbs-image."
+    ),
+)
+@click.option(
+    "--sbs-max-splats",
+    type=int,
+    default=None,
+    show_default=True,
+    help="Optional cap on SBS splat count for faster preview rendering. Only used with --sbs-image.",
+)
+@click.option(
+    "--sbs-prune-score",
+    type=click.Choice(["opacity", "opacity_scale"], case_sensitive=False),
+    default="opacity_scale",
+    show_default=True,
+    help="Score used to pick top-K SBS splats (opacity or opacity_scale). Only used with --sbs-image.",
+)
+@click.option(
     "--align-crop",
     is_flag=True,
     default=False,
@@ -354,6 +388,10 @@ def predict_cli(
     sbs_image_frame: int,
     stereo_strength: float,
     fast_preview_render: bool,
+    sbs_min_opacity: float,
+    sbs_min_scale: float,
+    sbs_max_splats: int | None,
+    sbs_prune_score: str,
     align_crop: bool,
     fast_preview_compare: bool,
     save_ply: bool | None,
@@ -567,6 +605,10 @@ def predict_cli(
             metadata = SceneMetaData(intrinsics[0, 0].item(), (width, height), "linearRGB")
 
             render_start = perf_counter()
+            sbs_prune_min_opacity = sbs_min_opacity if want_sbs_image else 0.0
+            sbs_prune_min_scale = sbs_min_scale if want_sbs_image else 0.0
+            sbs_prune_max_splats = sbs_max_splats if want_sbs_image else None
+            sbs_prune_score = sbs_prune_score.lower()
             if fast_preview_render:
                 if prediction.unprojection_matrix is None:
                     raise click.ClickException(
@@ -596,6 +638,10 @@ def predict_cli(
                         metrics=metrics,
                         sbs_async_writer=None,
                         stereo_baseline=stereo_strength,
+                        min_opacity=sbs_prune_min_opacity,
+                        min_scale=sbs_prune_min_scale,
+                        max_splats=sbs_prune_max_splats,
+                        prune_score=sbs_prune_score,
                     )
                 render_gaussians_pred_space(
                     gaussians=prediction.pred,
@@ -610,6 +656,10 @@ def predict_cli(
                     metrics=metrics,
                     sbs_async_writer=None if fast_preview_compare else sbs_async_writer,
                     stereo_baseline=stereo_strength,
+                    min_opacity=sbs_prune_min_opacity,
+                    min_scale=sbs_prune_min_scale,
+                    max_splats=sbs_prune_max_splats,
+                    prune_score=sbs_prune_score,
                 )
                 if fast_preview_compare and sbs_image_path is not None:
                     try:
@@ -645,6 +695,10 @@ def predict_cli(
                     metrics=metrics,
                     sbs_async_writer=sbs_async_writer,
                     stereo_baseline=stereo_strength if sbs_image_path is not None else 0.065,
+                    min_opacity=sbs_prune_min_opacity,
+                    min_scale=sbs_prune_min_scale,
+                    max_splats=sbs_prune_max_splats,
+                    prune_score=sbs_prune_score,
                 )
             metrics.add_time("render_total", perf_counter() - render_start)
 

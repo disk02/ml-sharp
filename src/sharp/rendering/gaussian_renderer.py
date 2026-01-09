@@ -11,7 +11,7 @@ import torch
 from PIL import Image
 
 from sharp.utils import camera, gsplat, io
-from sharp.utils.gaussians import Gaussians3D, SceneMetaData
+from sharp.utils.gaussians import Gaussians3D, SceneMetaData, prune_gaussians
 from sharp.utils.metrics import Metrics, RenderTiming
 
 
@@ -76,6 +76,10 @@ def render_gaussians(
     metrics: Metrics | None = None,
     sbs_async_writer: Any | None = None,
     stereo_baseline: float = 0.065,
+    min_opacity: float = 0.0,
+    min_scale: float = 0.0,
+    max_splats: int | None = None,
+    prune_score: str = "opacity_scale",
 ) -> None:
     """Render a single gaussian checkpoint file."""
     if metrics:
@@ -90,6 +94,14 @@ def render_gaussians(
         raise RuntimeError("Rendering a checkpoint requires CUDA.")
 
     device = torch.device("cuda")
+    gaussians = prune_gaussians(
+        gaussians,
+        min_opacity=min_opacity,
+        min_scale=min_scale,
+        max_splats=max_splats,
+        score=prune_score,
+    )
+    gaussians_device = gaussians.to(device)
 
     intrinsics = torch.tensor(
         [
@@ -166,23 +178,19 @@ def render_gaussians(
 
         if render_timing:
             with render_timing.timed_cpu("render_h2d_transfer"):
-                gaussians_l = gaussians.to(device)
                 extrinsics_l = extrinsics_l.to(device)
                 intrinsics_l = intrinsics_l.to(device)
-                gaussians_r = gaussians.to(device)
                 extrinsics_r = extrinsics_r.to(device)
                 intrinsics_r = intrinsics_r.to(device)
         else:
-            gaussians_l = gaussians.to(device)
             extrinsics_l = extrinsics_l.to(device)
             intrinsics_l = intrinsics_l.to(device)
-            gaussians_r = gaussians.to(device)
             extrinsics_r = extrinsics_r.to(device)
             intrinsics_r = intrinsics_r.to(device)
 
         # Left view
         rendering_output_l = renderer(
-            gaussians_l,
+            gaussians_device,
             extrinsics=extrinsics_l,
             intrinsics=intrinsics_l,
             image_width=camera_info_l.width,
@@ -193,7 +201,7 @@ def render_gaussians(
 
         # Right view
         rendering_output_r = renderer(
-            gaussians_r,
+            gaussians_device,
             extrinsics=extrinsics_r,
             intrinsics=intrinsics_r,
             image_width=camera_info_r.width,
@@ -350,6 +358,10 @@ def render_gaussians_pred_space(
     metrics: Metrics | None = None,
     sbs_async_writer: Any | None = None,
     stereo_baseline: float = 0.065,
+    min_opacity: float = 0.0,
+    min_scale: float = 0.0,
+    max_splats: int | None = None,
+    prune_score: str = "opacity_scale",
 ) -> None:
     """Render predicted-space Gaussians by folding unprojection into the camera."""
     if metrics:
@@ -364,6 +376,14 @@ def render_gaussians_pred_space(
         raise RuntimeError("Rendering a checkpoint requires CUDA.")
 
     device = torch.device("cuda")
+    gaussians = prune_gaussians(
+        gaussians,
+        min_opacity=min_opacity,
+        min_scale=min_scale,
+        max_splats=max_splats,
+        score=prune_score,
+    )
+    gaussians_device = gaussians.to(device)
 
     intrinsics = torch.tensor(
         [
@@ -377,7 +397,7 @@ def render_gaussians_pred_space(
     )
     u_pred_to_world = unprojection_matrix.to(device=device, dtype=torch.float32)
 
-    mean_vectors = gaussians.mean_vectors
+    mean_vectors = gaussians_device.mean_vectors
     if mean_vectors.ndim == 3:
         mean_vectors = mean_vectors[0]
     num_points = int(mean_vectors.shape[0])
@@ -386,10 +406,10 @@ def render_gaussians_pred_space(
     mean_sample = mean_vectors[sample_idx]
     mean_sample_world = mean_sample @ u_pred_to_world[:3, :3].T + u_pred_to_world[:3, 3]
     mean_sample_world = mean_sample_world.unsqueeze(0)
-    quaternions = gaussians.quaternions
-    singular_values = gaussians.singular_values
-    colors = gaussians.colors
-    opacities = gaussians.opacities
+    quaternions = gaussians_device.quaternions
+    singular_values = gaussians_device.singular_values
+    colors = gaussians_device.colors
+    opacities = gaussians_device.opacities
     if quaternions.ndim == 3:
         quaternions = quaternions[0][sample_idx].unsqueeze(0)
         singular_values = singular_values[0][sample_idx].unsqueeze(0)
@@ -461,22 +481,18 @@ def render_gaussians_pred_space(
 
         if render_timing:
             with render_timing.timed_cpu("render_h2d_transfer"):
-                gaussians_l = gaussians.to(device)
                 extrinsics_l = extrinsics_l.to(device) @ u_pred_to_world
                 intrinsics_l = intrinsics_l.to(device)
-                gaussians_r = gaussians.to(device)
                 extrinsics_r = extrinsics_r.to(device) @ u_pred_to_world
                 intrinsics_r = intrinsics_r.to(device)
         else:
-            gaussians_l = gaussians.to(device)
             extrinsics_l = extrinsics_l.to(device) @ u_pred_to_world
             intrinsics_l = intrinsics_l.to(device)
-            gaussians_r = gaussians.to(device)
             extrinsics_r = extrinsics_r.to(device) @ u_pred_to_world
             intrinsics_r = intrinsics_r.to(device)
 
         rendering_output_l = renderer(
-            gaussians_l,
+            gaussians_device,
             extrinsics=extrinsics_l[None],
             intrinsics=intrinsics_l,
             image_width=camera_info_l.width,
@@ -486,7 +502,7 @@ def render_gaussians_pred_space(
         )
 
         rendering_output_r = renderer(
-            gaussians_r,
+            gaussians_device,
             extrinsics=extrinsics_r[None],
             intrinsics=intrinsics_r,
             image_width=camera_info_r.width,
