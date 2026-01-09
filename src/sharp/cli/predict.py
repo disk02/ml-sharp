@@ -7,6 +7,7 @@ Copyright (C) 2025 Apple Inc. All Rights Reserved.
 from __future__ import annotations
 
 import logging
+import re
 import queue
 import threading
 from time import perf_counter
@@ -66,6 +67,18 @@ class PredictionResult:
 
 _SBS_ASYNC_QUEUE_SIZE = 8
 _SBS_ASYNC_WORKERS = 1
+
+
+def _natural_sort_key(path: Path, root: Path) -> tuple[object, ...]:
+    relative_path = path.relative_to(root).as_posix()
+    parts = re.split(r"(\d+)", relative_path)
+    key: list[object] = []
+    for part in parts:
+        if part.isdigit():
+            key.append(int(part))
+        else:
+            key.append(part.casefold())
+    return tuple(key)
 
 
 class AsyncImageWriter:
@@ -375,6 +388,10 @@ def predict_cli(
         return
     if batch_size < 1:
         raise click.ClickException("--batch-size must be >= 1.")
+
+    # Ensure deterministic traversal order since rglob follows filesystem order.
+    input_root = input_path if input_is_dir else input_path.parent
+    image_paths.sort(key=lambda path: _natural_sort_key(path, input_root))
 
     LOGGER.info("Input root: %s", input_path)
     LOGGER.info("Output root: %s", output_path)
