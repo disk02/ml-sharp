@@ -388,15 +388,17 @@ def predict_cli(
     if batch_size < 1:
         raise click.ClickException("--batch-size must be >= 1.")
 
-    def _natural_sort_key(path: Path) -> list[object]:
+    def _natural_sort_key(path: Path) -> list[tuple[int, object]]:
         relative_path = path.relative_to(input_path).as_posix()
         parts = re.split(r"(\d+)", relative_path)
-        key: list[object] = []
+        key: list[tuple[int, object]] = []
         for part in parts:
+            if not part:
+                continue
             if part.isdigit():
-                key.append(int(part))
+                key.append((0, int(part)))
             else:
-                key.append(part.casefold())
+                key.append((1, part.casefold()))
         return key
 
     # Ensure deterministic traversal order across filesystems before processing.
