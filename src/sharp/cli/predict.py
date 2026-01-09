@@ -259,6 +259,16 @@ def _align_for_compare(
     help="Which frame index to save for --sbs-image.",
 )
 @click.option(
+    "--stereo-strength",
+    type=float,
+    default=0.065,
+    show_default=True,
+    help=(
+        "Absolute stereo baseline for SBS rendering (world units, default 0.065). "
+        "Only used with --sbs-image."
+    ),
+)
+@click.option(
     "--fast-preview-render",
     is_flag=True,
     default=False,
@@ -342,6 +352,7 @@ def predict_cli(
     sbs_jpeg_quality: int,
     png_format: bool,
     sbs_image_frame: int,
+    stereo_strength: float,
     fast_preview_render: bool,
     align_crop: bool,
     fast_preview_compare: bool,
@@ -490,6 +501,12 @@ def predict_cli(
     if want_render_trajectory or want_sbs_image or fast_preview_render or fast_preview_compare:
         metrics.render_timing = RenderTiming()
 
+    # Allow SBS baseline customization to match capture rigs while keeping a safe disparity range.
+    if want_sbs_image and not 0.05 <= stereo_strength <= 0.07:
+        raise click.ClickException(
+            "--stereo-strength must be between 0.05 and 0.07 (world units)."
+        )
+
     sbs_async_writer: AsyncImageWriter | None = None
     if want_sbs_image and not fast_preview_compare:
         sbs_async_writer = AsyncImageWriter()
@@ -576,6 +593,7 @@ def predict_cli(
                         align_crop=align_crop,
                         metrics=metrics,
                         sbs_async_writer=None,
+                        stereo_baseline=stereo_strength,
                     )
                 render_gaussians_pred_space(
                     gaussians=prediction.pred,
@@ -589,6 +607,7 @@ def predict_cli(
                     align_crop=align_crop,
                     metrics=metrics,
                     sbs_async_writer=None if fast_preview_compare else sbs_async_writer,
+                    stereo_baseline=stereo_strength,
                 )
                 if fast_preview_compare and sbs_image_path is not None:
                     try:
@@ -623,6 +642,7 @@ def predict_cli(
                     align_crop=align_crop,
                     metrics=metrics,
                     sbs_async_writer=sbs_async_writer,
+                    stereo_baseline=stereo_strength if sbs_image_path is not None else 0.065,
                 )
             metrics.add_time("render_total", perf_counter() - render_start)
 

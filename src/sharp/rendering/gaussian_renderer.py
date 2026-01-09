@@ -75,6 +75,7 @@ def render_gaussians(
     align_crop: bool = False,
     metrics: Metrics | None = None,
     sbs_async_writer: Any | None = None,
+    stereo_baseline: float = 0.065,
 ) -> None:
     """Render a single gaussian checkpoint file."""
     if metrics:
@@ -104,8 +105,9 @@ def render_gaussians(
         gaussians, intrinsics, resolution_px=metadata.resolution_px
     )
 
-    # Stereo baseline (world units in the model's coordinate system).
-    baseline = 0.065
+    # Stereo baseline (world units in the model's coordinate system). Configurable so SBS
+    # outputs can match different capture rigs while keeping the midpoint fixed.
+    baseline = stereo_baseline
 
     # Number of camera animation loops.
     params.num_repeats = 3
@@ -347,6 +349,7 @@ def render_gaussians_pred_space(
     align_crop: bool = False,
     metrics: Metrics | None = None,
     sbs_async_writer: Any | None = None,
+    stereo_baseline: float = 0.065,
 ) -> None:
     """Render predicted-space Gaussians by folding unprojection into the camera."""
     if metrics:
@@ -403,7 +406,9 @@ def render_gaussians_pred_space(
         gaussians_camera_sample, intrinsics, resolution_px=metadata.resolution_px
     )
 
-    baseline = 0.065
+    # Stereo baseline (world units in the model's coordinate system). Configurable so SBS
+    # outputs can match different capture rigs while keeping the midpoint fixed.
+    baseline = stereo_baseline
     params.num_repeats = 3
     if sbs_image_path is not None:
         params.type = "static"
