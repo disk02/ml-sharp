@@ -57,7 +57,11 @@ def prune_gaussians(
     max_splats: int | None = None,
     score: PruneScore = "opacity_scale",
 ) -> Gaussians3D:
-    """Prune Gaussians by opacity/scale thresholds and optional top-K scoring."""
+    """Prune Gaussians by opacity/scale thresholds and optional top-K scoring.
+
+    Batched inputs keep rectangular output by prioritizing splats that pass thresholds
+    and filling remaining slots by score order.
+    """
     if min_opacity == 0.0 and min_scale == 0.0 and max_splats is None:
         return gaussians
     if score not in ("opacity", "opacity_scale"):
@@ -127,35 +131,46 @@ def prune_gaussians(
             opacities=pruned.opacities.unsqueeze(0),
         )
 
-    batch_size = gaussians.mean_vectors.shape[0]
+    batch_size, num_splats = gaussians.mean_vectors.shape[:2]
     scores_batched = _scores(opacities, max_scale)
-    candidate_indices: list[torch.Tensor] = []
-    candidate_scores: list[torch.Tensor] = []
-    for batch in range(batch_size):
+    target_count = num_splats
+    if max_splats is not None:
+        target_count = min(target_count, max_splats)
+    target_count = max(target_count, 1)
+
+    def _select_indices(batch: int) -> torch.Tensor:
         mask = (opacities[batch] >= min_opacity) & (max_scale[batch] >= min_scale)
-        if mask.any():
-            idx = mask.nonzero(as_tuple=False).flatten()
-        else:
+        scores = scores_batched[batch]
+        kept_idx = mask.nonzero(as_tuple=False).flatten()
+        dropped_idx = (~mask).nonzero(as_tuple=False).flatten()
+        if kept_idx.numel() == 0:
             LOGGER.warning(
                 "All splats pruned for batch %d; keeping the best-scoring splat.",
                 batch,
             )
-            idx = scores_batched[batch].argmax().view(1)
-        candidate_indices.append(idx)
-        candidate_scores.append(scores_batched[batch][idx])
-
-    min_count = min(int(idx.numel()) for idx in candidate_indices)
-    if max_splats is not None:
-        min_count = min(min_count, max_splats)
-    min_count = max(min_count, 1)
+        if kept_idx.numel():
+            kept_order = torch.argsort(scores[kept_idx], descending=True)
+        else:
+            kept_order = kept_idx
+        if dropped_idx.numel():
+            drop_order = torch.argsort(scores[dropped_idx], descending=True)
+        else:
+            drop_order = dropped_idx
+        ordered = torch.cat(
+            (
+                kept_idx[kept_order] if kept_idx.numel() else kept_idx,
+                dropped_idx[drop_order] if dropped_idx.numel() else dropped_idx,
+            ),
+            dim=0,
+        )
+        if ordered.numel() == 0:
+            ordered = scores.argmax().view(1)
+        return ordered[:target_count]
 
     def _gather_field(tensor: torch.Tensor) -> torch.Tensor:
         gathered: list[torch.Tensor] = []
         for batch in range(batch_size):
-            idx = candidate_indices[batch]
-            scores = candidate_scores[batch]
-            topk = torch.topk(scores, k=min_count).indices
-            chosen = idx[topk]
+            chosen = _select_indices(batch)
             gathered.append(tensor[batch].index_select(0, chosen))
         return torch.stack(gathered, dim=0)
 

@@ -114,7 +114,7 @@ def render_gaussians(
         dtype=torch.float32,
     )
     camera_model = camera.create_camera_model(
-        gaussians, intrinsics, resolution_px=metadata.resolution_px
+        gaussians_device, intrinsics, resolution_px=metadata.resolution_px
     )
 
     # Stereo baseline (world units in the model's coordinate system). Configurable so SBS
@@ -130,7 +130,7 @@ def render_gaussians(
         sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
 
     trajectory = camera.create_eye_trajectory(
-        gaussians, params, resolution_px=metadata.resolution_px, f_px=f_px
+        gaussians_device, params, resolution_px=metadata.resolution_px, f_px=f_px
     )
     renderer = gsplat.GSplatRenderer(color_space=metadata.color_space)
     render_timing = metrics.render_timing if metrics else None
