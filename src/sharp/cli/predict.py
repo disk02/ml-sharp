@@ -502,7 +502,7 @@ def predict_cli(
         metrics.render_timing = RenderTiming()
 
     # Allow SBS baseline customization to match capture rigs while keeping a safe disparity range.
-    if not 0.05 <= stereo_strength <= 0.07:
+    if want_sbs_image and not 0.05 <= stereo_strength <= 0.07:
         raise click.ClickException(
             "--stereo-strength must be between 0.05 and 0.07 (world units)."
         )
@@ -582,19 +582,19 @@ def predict_cli(
                     baseline_path = sbs_image_path.with_name(
                         f"{sbs_image_path.stem}_baseline{sbs_image_path.suffix}"
                     )
-                render_gaussians(
-                    gaussians=prediction.world,
-                    metadata=metadata,
-                    output_path=output_video_path,
-                    sbs_image_path=baseline_path,
-                    sbs_image_format=effective_sbs_format,
-                    sbs_jpeg_quality=sbs_jpeg_quality,
-                    sbs_image_frame=sbs_image_frame,
-                    align_crop=align_crop,
-                    metrics=metrics,
-                    sbs_async_writer=None,
-                    stereo_baseline=stereo_strength,
-                )
+                    render_gaussians(
+                        gaussians=prediction.world,
+                        metadata=metadata,
+                        output_path=output_video_path,
+                        sbs_image_path=baseline_path,
+                        sbs_image_format=effective_sbs_format,
+                        sbs_jpeg_quality=sbs_jpeg_quality,
+                        sbs_image_frame=sbs_image_frame,
+                        align_crop=align_crop,
+                        metrics=metrics,
+                        sbs_async_writer=None,
+                        stereo_baseline=stereo_strength,
+                    )
                 render_gaussians_pred_space(
                     gaussians=prediction.pred,
                     metadata=metadata,
