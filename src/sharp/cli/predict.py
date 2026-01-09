@@ -6,13 +6,14 @@ Copyright (C) 2025 Apple Inc. All Rights Reserved.
 
 from __future__ import annotations
 
+import io as py_io
 import logging
 import queue
+import re
 import threading
-from time import perf_counter
 from dataclasses import dataclass
-import io as py_io
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Literal
 
 import click
@@ -375,6 +376,20 @@ def predict_cli(
         return
     if batch_size < 1:
         raise click.ClickException("--batch-size must be >= 1.")
+
+    def _natural_sort_key(path: Path) -> list[object]:
+        relative_path = path.relative_to(input_path).as_posix()
+        parts = re.split(r"(\d+)", relative_path)
+        key: list[object] = []
+        for part in parts:
+            if part.isdigit():
+                key.append(int(part))
+            else:
+                key.append(part.casefold())
+        return key
+
+    # Ensure deterministic traversal order across filesystems before processing.
+    image_paths.sort(key=_natural_sort_key)
 
     LOGGER.info("Input root: %s", input_path)
     LOGGER.info("Output root: %s", output_path)
