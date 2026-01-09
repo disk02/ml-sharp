@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io as py_io
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -15,12 +16,33 @@ from sharp.utils.metrics import Metrics, RenderTiming
 
 
 def _save_sbs_image(
-    img: Image.Image,
+    img: Image.Image | np.ndarray,
     sbs_image_path: Path,
     sbs_image_format: str | None,
     sbs_jpeg_quality: int,
     render_timing: RenderTiming | None,
+    sbs_async_writer: Any | None = None,
 ) -> None:
+    if sbs_async_writer is not None:
+        if render_timing:
+            with render_timing.timed_cpu("render_encode_write"):
+                sbs_async_writer.submit(
+                    sbs_image_path,
+                    img,
+                    sbs_image_format=sbs_image_format,
+                    sbs_jpeg_quality=sbs_jpeg_quality,
+                )
+        else:
+            sbs_async_writer.submit(
+                sbs_image_path,
+                img,
+                sbs_image_format=sbs_image_format,
+                sbs_jpeg_quality=sbs_jpeg_quality,
+            )
+        return
+
+    if isinstance(img, np.ndarray):
+        img = Image.fromarray(img, mode="RGB")
     img_format = Image.registered_extensions().get(sbs_image_path.suffix.lower())
     save_kwargs: dict[str, object] = {}
     if sbs_image_format == "jpg":
@@ -52,6 +74,7 @@ def render_gaussians(
     sbs_image_frame: int = 0,
     align_crop: bool = False,
     metrics: Metrics | None = None,
+    sbs_async_writer: Any | None = None,
 ) -> None:
     """Render a single gaussian checkpoint file."""
     if metrics:
@@ -225,7 +248,11 @@ def render_gaussians(
                         )
 
                     color_sbs_np = np.concatenate((color_l_np, color_r_np), axis=1)
-                    img = Image.fromarray(color_sbs_np, mode="RGB")
+                    img = (
+                        color_sbs_np
+                        if sbs_async_writer is not None
+                        else Image.fromarray(color_sbs_np, mode="RGB")
+                    )
                     sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
                 _save_sbs_image(
                     img,
@@ -233,6 +260,7 @@ def render_gaussians(
                     sbs_image_format,
                     sbs_jpeg_quality,
                     render_timing,
+                    sbs_async_writer,
                 )
             else:
                 if align_crop:
@@ -250,7 +278,11 @@ def render_gaussians(
                     )
 
                 color_sbs_np = np.concatenate((color_l_np, color_r_np), axis=1)
-                img = Image.fromarray(color_sbs_np, mode="RGB")
+                img = (
+                    color_sbs_np
+                    if sbs_async_writer is not None
+                    else Image.fromarray(color_sbs_np, mode="RGB")
+                )
                 sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
                 _save_sbs_image(
                     img,
@@ -258,6 +290,7 @@ def render_gaussians(
                     sbs_image_format,
                     sbs_jpeg_quality,
                     None,
+                    sbs_async_writer,
                 )
             if render_timing:
                 render_timing.finalize_frame()
@@ -290,6 +323,7 @@ def render_gaussians_pred_space(
     sbs_image_frame: int = 0,
     align_crop: bool = False,
     metrics: Metrics | None = None,
+    sbs_async_writer: Any | None = None,
 ) -> None:
     """Render predicted-space Gaussians by folding unprojection into the camera."""
     if metrics:
@@ -476,7 +510,11 @@ def render_gaussians_pred_space(
                         )
 
                     color_sbs_np = np.concatenate((color_l_np, color_r_np), axis=1)
-                    img = Image.fromarray(color_sbs_np, mode="RGB")
+                    img = (
+                        color_sbs_np
+                        if sbs_async_writer is not None
+                        else Image.fromarray(color_sbs_np, mode="RGB")
+                    )
                     sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
                 _save_sbs_image(
                     img,
@@ -484,6 +522,7 @@ def render_gaussians_pred_space(
                     sbs_image_format,
                     sbs_jpeg_quality,
                     render_timing,
+                    sbs_async_writer,
                 )
             else:
                 if align_crop:
@@ -501,7 +540,11 @@ def render_gaussians_pred_space(
                     )
 
                 color_sbs_np = np.concatenate((color_l_np, color_r_np), axis=1)
-                img = Image.fromarray(color_sbs_np, mode="RGB")
+                img = (
+                    color_sbs_np
+                    if sbs_async_writer is not None
+                    else Image.fromarray(color_sbs_np, mode="RGB")
+                )
                 sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
                 _save_sbs_image(
                     img,
@@ -509,6 +552,7 @@ def render_gaussians_pred_space(
                     sbs_image_format,
                     sbs_jpeg_quality,
                     None,
+                    sbs_async_writer,
                 )
             if render_timing:
                 render_timing.finalize_frame()

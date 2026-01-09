@@ -7,16 +7,20 @@ Copyright (C) 2025 Apple Inc. All Rights Reserved.
 from __future__ import annotations
 
 import logging
+import queue
+import threading
 from time import perf_counter
 from dataclasses import dataclass
+import io as py_io
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import click
 import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.utils.data
+from PIL import Image
 
 from sharp.models import (
     PredictorParams,
@@ -58,6 +62,87 @@ class PredictionResult:
     world: Gaussians3D | None = None
     unprojection_matrix: torch.Tensor | None = None
     unprojection_context: UnprojectionContext | None = None
+
+
+_SBS_ASYNC_QUEUE_SIZE = 8
+_SBS_ASYNC_WORKERS = 1
+
+
+class AsyncImageWriter:
+    def __init__(self, maxsize: int = _SBS_ASYNC_QUEUE_SIZE, workers: int = _SBS_ASYNC_WORKERS):
+        self._queue: queue.Queue[tuple[Path, np.ndarray | Image.Image, str | None, int] | None]
+        self._queue = queue.Queue(maxsize=maxsize)
+        self._threads: list[threading.Thread] = []
+        self._error: BaseException | None = None
+        self._closed = False
+        for idx in range(workers):
+            thread = threading.Thread(target=self._worker, name=f"sbs-writer-{idx}", daemon=True)
+            thread.start()
+            self._threads.append(thread)
+
+    def submit(
+        self,
+        path: Path,
+        image: np.ndarray | Image.Image,
+        *,
+        sbs_image_format: str | None,
+        sbs_jpeg_quality: int,
+    ) -> None:
+        self.raise_if_failed()
+        if self._closed:
+            raise click.ClickException("Async SBS writer is closed.")
+        self._queue.put((path, image, sbs_image_format, sbs_jpeg_quality))
+        self.raise_if_failed()
+
+    def raise_if_failed(self) -> None:
+        if self._error is not None:
+            raise click.ClickException(f"Async SBS writer failed: {self._error}") from self._error
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for _ in self._threads:
+            self._queue.put(None)
+        for thread in self._threads:
+            thread.join()
+        self.raise_if_failed()
+
+    def _worker(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is None:
+                self._queue.task_done()
+                return
+            path, image, sbs_image_format, sbs_jpeg_quality = item
+            try:
+                self._save_image(path, image, sbs_image_format, sbs_jpeg_quality)
+            except BaseException as exc:  # pragma: no cover - best-effort propagation
+                if self._error is None:
+                    self._error = exc
+            finally:
+                self._queue.task_done()
+
+    def _save_image(
+        self,
+        path: Path,
+        image: np.ndarray | Image.Image,
+        sbs_image_format: str | None,
+        sbs_jpeg_quality: int,
+    ) -> None:
+        img = image if isinstance(image, Image.Image) else Image.fromarray(image, mode="RGB")
+        img_format = Image.registered_extensions().get(path.suffix.lower())
+        save_kwargs: dict[str, object] = {}
+        if sbs_image_format == "jpg":
+            img = img.convert("RGB")
+            save_kwargs = {"quality": sbs_jpeg_quality, "subsampling": 0, "optimize": False}
+        if img_format is None:
+            img.save(path, **save_kwargs)
+        else:
+            bytes_io = py_io.BytesIO()
+            img.save(bytes_io, format=img_format, **save_kwargs)
+            with path.open("wb") as file_handle:
+                file_handle.write(bytes_io.getvalue())
 
 
 def _align_for_compare(
@@ -235,6 +320,16 @@ def _align_for_compare(
     show_default=True,
     help="Data type for CUDA AMP autocast.",
 )
+@click.option(
+    "--batch-size",
+    type=int,
+    default=1,
+    show_default=True,
+    help=(
+        "Micro-batch size for model forward (prediction only). "
+        "Rendering/saving is still per-image."
+    ),
+)
 @click.option("-v", "--verbose", is_flag=True, help="Activate debug logs.")
 def predict_cli(
     input_path: Path,
@@ -256,6 +351,7 @@ def predict_cli(
     device: str,
     amp: bool | None,
     amp_dtype: str,
+    batch_size: int,
     verbose: bool,
 ):
     """Predict Gaussians from input images."""
@@ -277,6 +373,8 @@ def predict_cli(
             raise click.ClickException(f"No valid inputs found under {input_path}.")
         LOGGER.info("No valid images found. Input was %s.", input_path)
         return
+    if batch_size < 1:
+        raise click.ClickException("--batch-size must be >= 1.")
 
     LOGGER.info("Input root: %s", input_path)
     LOGGER.info("Output root: %s", output_path)
@@ -304,6 +402,11 @@ def predict_cli(
 
     amp_dtype_lower = amp_dtype.lower()
     amp_autocast_dtype = torch.float16 if amp_dtype_lower == "fp16" else torch.bfloat16
+    amp_dtype_to_use: torch.dtype | None = None
+    if amp and device == "cuda":
+        amp_dtype_to_use = amp_autocast_dtype
+        if amp_autocast_dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+            amp_dtype_to_use = torch.float16
     LOGGER.info(
         "Predict settings: device=%s amp=%s amp_dtype=%s",
         device,
@@ -332,7 +435,7 @@ def predict_cli(
     metrics = Metrics()
 
     want_sbs_image = sbs_image is not None
-    want_video = with_rendering
+    want_render_trajectory = with_rendering
     if not want_sbs_image and (sbs_format is not None or png_format):
         LOGGER.warning("--sbs-format/--png-format ignored because --sbs-image was not set.")
     effective_sbs_format = None
@@ -359,7 +462,7 @@ def predict_cli(
         raise click.ClickException("--fast-preview-compare requires --sbs-image.")
     if fast_preview_compare and not fast_preview_render:
         raise click.ClickException("--fast-preview-compare requires --fast-preview-render.")
-    if fast_preview_render and want_video:
+    if fast_preview_render and want_render_trajectory:
         raise click.ClickException(
             "--fast-preview-render is only supported for --sbs-image (not --render)."
         )
@@ -369,69 +472,28 @@ def predict_cli(
         effective_save_ply = True
     else:
         effective_save_ply = bool(save_ply)
-    if want_video or want_sbs_image or fast_preview_render or fast_preview_compare:
+    if want_render_trajectory or want_sbs_image or fast_preview_render or fast_preview_compare:
         metrics.render_timing = RenderTiming()
 
-    run_start = perf_counter()
-    for index, image_path in enumerate(image_paths, start=1):
-        image_start = perf_counter()
-        rel_path = image_path.relative_to(input_path) if input_is_dir else Path(image_path.name)
-        out_dir = output_path / rel_path.parent if input_is_dir else output_path
-        out_dir.mkdir(parents=True, exist_ok=True)
-        LOGGER.info("Processing %s (%d/%d)", image_path, index, len(image_paths))
-        io_start = perf_counter()
-        image, _, f_px = io.load_rgb(image_path)
-        metrics.add_time("io_decode", perf_counter() - io_start)
-        height, width = image.shape[:2]
-        intrinsics = torch.tensor(
-            [
-                [f_px, 0, (width - 1) / 2.0, 0],
-                [0, f_px, (height - 1) / 2.0, 0],
-                [0, 0, 1, 0],
-                [0, 0, 0, 1],
-            ],
-            device=device,
-            dtype=torch.float32,
-        )
-        want_world_for_render = (
-            want_video or (want_sbs_image and not fast_preview_render) or fast_preview_compare
-        )
-        defer_export_world = defer_world_conversion_for_export or (
-            fast_preview_render and not fast_preview_compare
-        )
-        want_world_for_predict = want_world_for_render or (
-            effective_save_ply and not defer_export_world
-        )
-        if skip_world_conversion and (want_world_for_predict or effective_save_ply):
-            raise click.ClickException(
-                "World-space conversion is required for rendering or PLY export. "
-                "Disable --skip-world-conversion or disable those outputs."
-            )
-        if skip_world_conversion:
-            LOGGER.info("Skipping world conversion (unproject/apply_transform).")
-        if fast_preview_render and not want_world_for_predict:
-            if effective_save_ply:
-                LOGGER.info("Using fast preview render; deferring world conversion for export.")
-            else:
-                LOGGER.info("Using fast preview render; skipping world conversion.")
-        space: GaussianSpace = "world" if want_world_for_predict else "pred"
-        LOGGER.info("Computing world-space gaussians: %s", "yes" if space == "world" else "no")
+    sbs_async_writer: AsyncImageWriter | None = None
+    if want_sbs_image and not fast_preview_compare:
+        sbs_async_writer = AsyncImageWriter()
+        LOGGER.info("Async SBS image writer enabled.")
 
-        predict_start = perf_counter()
-        prediction = predict_image(
-            gaussian_predictor,
-            image,
-            f_px,
-            torch.device(device),
-            amp_enabled=amp,
-            amp_dtype=amp_autocast_dtype,
-            metrics=metrics,
-            return_world=want_world_for_predict,
-            return_unprojection=fast_preview_render,
-            return_unprojection_context=fast_preview_render or effective_save_ply,
-        )
-        metrics.add_time("predict_total", perf_counter() - predict_start)
-
+    def _finalize_prediction(
+        *,
+        prediction: PredictionResult,
+        image_path: Path,
+        rel_path: Path,
+        out_dir: Path,
+        image: np.ndarray,
+        f_px: float,
+        height: int,
+        width: int,
+        intrinsics: torch.Tensor,
+        image_start: float,
+        sbs_async_writer: AsyncImageWriter | None,
+    ) -> None:
         # Determine SBS image output path (optional)
         sbs_image_path: Path | None = None
         if want_sbs_image:
@@ -460,8 +522,8 @@ def predict_cli(
             if sbs_image_path is not None:
                 sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
 
-        if want_video or sbs_image_path is not None:
-            if want_video:
+        if want_render_trajectory or sbs_image_path is not None:
+            if want_render_trajectory:
                 output_video_path = (out_dir / image_path.stem).with_suffix(".mp4")
                 LOGGER.info("Rendering trajectory to %s", output_video_path)
             else:
@@ -498,6 +560,7 @@ def predict_cli(
                         sbs_image_frame=sbs_image_frame,
                         align_crop=align_crop,
                         metrics=metrics,
+                        sbs_async_writer=None,
                     )
                 render_gaussians_pred_space(
                     gaussians=prediction.pred,
@@ -510,6 +573,7 @@ def predict_cli(
                     sbs_image_frame=sbs_image_frame,
                     align_crop=align_crop,
                     metrics=metrics,
+                    sbs_async_writer=None if fast_preview_compare else sbs_async_writer,
                 )
                 if fast_preview_compare and sbs_image_path is not None:
                     try:
@@ -543,6 +607,7 @@ def predict_cli(
                     sbs_image_frame=sbs_image_frame,
                     align_crop=align_crop,
                     metrics=metrics,
+                    sbs_async_writer=sbs_async_writer,
                 )
             metrics.add_time("render_total", perf_counter() - render_start)
 
@@ -581,8 +646,436 @@ def predict_cli(
             else:
                 LOGGER.info("Skipping .ply save because --no-save-ply was requested.")
         metrics.add_time("per_image_total", perf_counter() - image_start)
+
+    run_start = perf_counter()
+    try:
+        if batch_size <= 1 or len(image_paths) == 1:
+            for index, image_path in enumerate(image_paths, start=1):
+                image_start = perf_counter()
+                rel_path = image_path.relative_to(input_path) if input_is_dir else Path(image_path.name)
+                out_dir = output_path / rel_path.parent if input_is_dir else output_path
+                out_dir.mkdir(parents=True, exist_ok=True)
+                LOGGER.info("Processing %s (%d/%d)", image_path, index, len(image_paths))
+                io_start = perf_counter()
+                image, _, f_px = io.load_rgb(image_path)
+                metrics.add_time("io_decode", perf_counter() - io_start)
+                height, width = image.shape[:2]
+                intrinsics = torch.tensor(
+                    [
+                        [f_px, 0, (width - 1) / 2.0, 0],
+                        [0, f_px, (height - 1) / 2.0, 0],
+                        [0, 0, 1, 0],
+                        [0, 0, 0, 1],
+                    ],
+                    device=device,
+                    dtype=torch.float32,
+                )
+                want_world_for_render = (
+                    want_render_trajectory
+                    or (want_sbs_image and not fast_preview_render)
+                    or fast_preview_compare
+                )
+                defer_export_world = defer_world_conversion_for_export or (
+                    fast_preview_render and not fast_preview_compare
+                )
+                want_world_for_predict = want_world_for_render or (
+                    effective_save_ply and not defer_export_world
+                )
+                if skip_world_conversion and (want_world_for_predict or effective_save_ply):
+                    raise click.ClickException(
+                        "World-space conversion is required for rendering or PLY export. "
+                        "Disable --skip-world-conversion or disable those outputs."
+                    )
+                if skip_world_conversion:
+                    LOGGER.info("Skipping world conversion (unproject/apply_transform).")
+                if fast_preview_render and not want_world_for_predict:
+                    if effective_save_ply:
+                        LOGGER.info("Using fast preview render; deferring world conversion for export.")
+                    else:
+                        LOGGER.info("Using fast preview render; skipping world conversion.")
+                space: GaussianSpace = "world" if want_world_for_predict else "pred"
+                LOGGER.info("Computing world-space gaussians: %s", "yes" if space == "world" else "no")
+
+                predict_start = perf_counter()
+                prediction = predict_image(
+                    gaussian_predictor,
+                    image,
+                    f_px,
+                    torch.device(device),
+                    amp_enabled=amp,
+                    amp_dtype=amp_dtype_to_use,
+                    metrics=metrics,
+                    return_world=want_world_for_predict,
+                    return_unprojection=fast_preview_render,
+                    return_unprojection_context=fast_preview_render or effective_save_ply,
+                )
+                metrics.add_time("predict_total", perf_counter() - predict_start)
+                _finalize_prediction(
+                    prediction=prediction,
+                    image_path=image_path,
+                    rel_path=rel_path,
+                    out_dir=out_dir,
+                    image=image,
+                    f_px=f_px,
+                    height=height,
+                    width=width,
+                    intrinsics=intrinsics,
+                    image_start=image_start,
+                    sbs_async_writer=sbs_async_writer,
+                )
+        else:
+            total_images = len(image_paths)
+            for batch_start in range(0, total_images, batch_size):
+                batch_paths = image_paths[batch_start : batch_start + batch_size]
+                batch_items: list[dict[str, Any]] = []
+                for offset, image_path in enumerate(batch_paths):
+                    index = batch_start + offset + 1
+                    image_start = perf_counter()
+                    rel_path = (
+                        image_path.relative_to(input_path) if input_is_dir else Path(image_path.name)
+                    )
+                    out_dir = output_path / rel_path.parent if input_is_dir else output_path
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    LOGGER.info("Processing %s (%d/%d)", image_path, index, total_images)
+                    io_start = perf_counter()
+                    image, _, f_px = io.load_rgb(image_path)
+                    metrics.add_time("io_decode", perf_counter() - io_start)
+                    height, width = image.shape[:2]
+                    intrinsics = torch.tensor(
+                        [
+                            [f_px, 0, (width - 1) / 2.0, 0],
+                            [0, f_px, (height - 1) / 2.0, 0],
+                            [0, 0, 1, 0],
+                            [0, 0, 0, 1],
+                        ],
+                        device=device,
+                        dtype=torch.float32,
+                    )
+                    want_world_for_render = (
+                        want_render_trajectory
+                        or (want_sbs_image and not fast_preview_render)
+                        or fast_preview_compare
+                    )
+                    defer_export_world = defer_world_conversion_for_export or (
+                        fast_preview_render and not fast_preview_compare
+                    )
+                    want_world_for_predict = want_world_for_render or (
+                        effective_save_ply and not defer_export_world
+                    )
+                    if skip_world_conversion and (want_world_for_predict or effective_save_ply):
+                        raise click.ClickException(
+                            "World-space conversion is required for rendering or PLY export. "
+                            "Disable --skip-world-conversion or disable those outputs."
+                        )
+                    if skip_world_conversion:
+                        LOGGER.info("Skipping world conversion (unproject/apply_transform).")
+                    if fast_preview_render and not want_world_for_predict:
+                        if effective_save_ply:
+                            LOGGER.info(
+                                "Using fast preview render; deferring world conversion for export."
+                            )
+                        else:
+                            LOGGER.info("Using fast preview render; skipping world conversion.")
+                    space: GaussianSpace = "world" if want_world_for_predict else "pred"
+                    LOGGER.info(
+                        "Computing world-space gaussians: %s", "yes" if space == "world" else "no"
+                    )
+
+                    preprocess_start = perf_counter() if metrics else None
+                    image_resized_pt, disparity_factor, aux = preprocess_one(
+                        image,
+                        f_px,
+                        torch.device(device),
+                        target_size_wh=(1536, 1536),
+                        dtype=torch.float32,
+                    )
+                    aux["metrics"] = metrics
+                    preprocess_elapsed = 0.0
+                    if metrics and preprocess_start is not None:
+                        preprocess_elapsed = perf_counter() - preprocess_start
+                        metrics.add_time("preprocess", preprocess_elapsed)
+                    batch_items.append(
+                        {
+                            "image_path": image_path,
+                            "rel_path": rel_path,
+                            "out_dir": out_dir,
+                            "image": image,
+                            "f_px": f_px,
+                            "height": height,
+                            "width": width,
+                            "intrinsics": intrinsics,
+                            "image_start": image_start,
+                            "preprocess_elapsed": preprocess_elapsed,
+                            "want_world_for_predict": want_world_for_predict,
+                            "aux": aux,
+                            "image_resized_pt": image_resized_pt,
+                            "disparity_factor": disparity_factor,
+                        }
+                    )
+
+                image_resized_batch = torch.cat(
+                    [item["image_resized_pt"] for item in batch_items], dim=0
+                )
+                disparity_factor_batch = torch.cat(
+                    [item["disparity_factor"] for item in batch_items], dim=0
+                )
+
+                forward_start = perf_counter() if metrics else None
+                try:
+                    gaussians_ndc_batch = model_forward_batch(
+                        gaussian_predictor,
+                        image_resized_batch,
+                        disparity_factor_batch,
+                        amp_dtype=amp_dtype_to_use,
+                    )
+                except torch.cuda.OutOfMemoryError as exc:
+                    if device == "cuda":
+                        torch.cuda.empty_cache()
+                    raise click.ClickException(
+                        f"CUDA out of memory during batched forward (batch_size={len(batch_items)}). "
+                        "Try a smaller --batch-size."
+                    ) from exc
+                except RuntimeError as exc:
+                    if "out of memory" in str(exc).lower():
+                        if device == "cuda":
+                            torch.cuda.empty_cache()
+                        raise click.ClickException(
+                            f"CUDA out of memory during batched forward (batch_size={len(batch_items)}). "
+                            "Try a smaller --batch-size."
+                        ) from exc
+                    raise
+                forward_elapsed = 0.0
+                if metrics and forward_start is not None:
+                    forward_elapsed = perf_counter() - forward_start
+                    metrics.add_time("model_forward", forward_elapsed)
+
+                postprocess_start = perf_counter() if metrics else None
+                for batch_index, item in enumerate(batch_items):
+                    gaussians_ndc_one = _slice_gaussians(gaussians_ndc_batch, batch_index)
+                    prediction = postprocess_one(
+                        gaussians_ndc_one,
+                        item["aux"],
+                        return_world=item["want_world_for_predict"],
+                        return_unprojection=fast_preview_render or effective_save_ply,
+                        device=torch.device(device),
+                    )
+                    item["prediction"] = prediction
+                postprocess_elapsed = 0.0
+                if metrics and postprocess_start is not None:
+                    postprocess_elapsed = perf_counter() - postprocess_start
+                    metrics.add_time("postprocess", postprocess_elapsed)
+
+                batch_count = len(batch_items)
+                forward_share = forward_elapsed / batch_count if batch_count else 0.0
+                postprocess_share = postprocess_elapsed / batch_count if batch_count else 0.0
+                for item in batch_items:
+                    predict_total = (
+                        item["preprocess_elapsed"] + forward_share + postprocess_share
+                    )
+                    metrics.add_time("predict_total", predict_total)
+                    _finalize_prediction(
+                        prediction=item["prediction"],
+                        image_path=item["image_path"],
+                        rel_path=item["rel_path"],
+                        out_dir=item["out_dir"],
+                        image=item["image"],
+                        f_px=item["f_px"],
+                        height=item["height"],
+                        width=item["width"],
+                        intrinsics=item["intrinsics"],
+                        image_start=item["image_start"],
+                        sbs_async_writer=sbs_async_writer,
+                    )
+    finally:
+        if sbs_async_writer is not None:
+            drain_start = perf_counter()
+            sbs_async_writer.close()
+            metrics.add_time("sbs_async_drain", perf_counter() - drain_start)
     metrics.add_time("run_total", perf_counter() - run_start)
     _log_metrics_summary(metrics)
+
+
+def preprocess_one(
+    image_np: np.ndarray,
+    f_px: float,
+    device: torch.device,
+    *,
+    target_size_wh: tuple[int, int],
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, dict]:
+    target_w, target_h = target_size_wh
+    image_np = np.ascontiguousarray(image_np)
+    if not image_np.flags.writeable:
+        image_np = image_np.copy()
+    image_pt = torch.from_numpy(image_np).to(dtype=dtype, device=device).permute(2, 0, 1)
+    image_pt = image_pt / 255.0
+    _, height, width = image_pt.shape
+    disparity_factor_pt = torch.tensor([f_px / width], dtype=dtype, device=device)
+    image_resized_pt = F.interpolate(
+        image_pt[None],
+        size=(target_h, target_w),
+        mode="bilinear",
+        align_corners=True,
+    )
+    # target_size_wh is (W, H); interpolate expects (H, W).
+    # image_resized_pt: (B, C, H, W) with B=1 for now.
+    if __debug__:
+        assert image_resized_pt.ndim == 4
+        assert image_resized_pt.shape[0] == 1
+        assert disparity_factor_pt.ndim >= 1
+        assert disparity_factor_pt.shape[0] == 1
+    aux = {
+        "height": height,
+        "width": width,
+        "f_px": f_px,
+        "target_w": target_w,
+        "target_h": target_h,
+    }
+    return image_resized_pt, disparity_factor_pt, aux
+
+
+def _slice_gaussians(gaussians: Gaussians3D, idx: int) -> Gaussians3D:
+    """Return a view of a single batch element while preserving the batch dim."""
+    sl = slice(idx, idx + 1)
+    return Gaussians3D(
+        mean_vectors=gaussians.mean_vectors[sl],
+        singular_values=gaussians.singular_values[sl],
+        quaternions=gaussians.quaternions[sl],
+        colors=gaussians.colors[sl],
+        opacities=gaussians.opacities[sl],
+    )
+
+
+def model_forward_batch(
+    predictor: torch.nn.Module,
+    image_resized_pt: torch.Tensor,
+    disparity_factor_pt: torch.Tensor,
+    *,
+    amp_dtype: torch.dtype | None,
+) -> Any:
+    with torch.inference_mode():
+        # CUDA uses autocast when amp_dtype is set; CPU/MPS run without autocast.
+        if image_resized_pt.device.type == "cuda":
+            with torch.autocast(
+                device_type="cuda", dtype=amp_dtype, enabled=amp_dtype is not None
+            ):
+                return predictor(image_resized_pt, disparity_factor_pt)
+        return predictor(image_resized_pt, disparity_factor_pt)
+
+
+def postprocess_one(
+    gaussians_ndc_one: Gaussians3D,
+    aux: dict,
+    *,
+    return_world: bool,
+    return_unprojection: bool,
+    device: torch.device,
+) -> PredictionResult:
+    need_cast = any(
+        tensor.dtype != torch.float32
+        for tensor in (
+            gaussians_ndc_one.mean_vectors,
+            gaussians_ndc_one.singular_values,
+            gaussians_ndc_one.quaternions,
+            gaussians_ndc_one.colors,
+            gaussians_ndc_one.opacities,
+        )
+    )
+    if need_cast:
+        mean_vectors = gaussians_ndc_one.mean_vectors.float()
+        singular_values = gaussians_ndc_one.singular_values.float()
+        quaternions = gaussians_ndc_one.quaternions.float()
+        colors = gaussians_ndc_one.colors.float()
+        opacities = gaussians_ndc_one.opacities.float()
+    else:
+        mean_vectors = gaussians_ndc_one.mean_vectors
+        singular_values = gaussians_ndc_one.singular_values
+        quaternions = gaussians_ndc_one.quaternions
+        colors = gaussians_ndc_one.colors
+        opacities = gaussians_ndc_one.opacities
+    quat_norm = quaternions.norm(dim=-1, keepdim=True)
+    quat_norm_abs = quat_norm.abs()
+    quat_finite = torch.isfinite(quat_norm)
+    quat_too_small = quat_norm_abs <= 1e-8
+    quat_off_unit = (quat_norm_abs - 1.0).abs() > 1e-3
+    quat_valid = quat_finite & ~quat_too_small
+    need_quat_fix = bool((~quat_finite).any() | quat_too_small.any() | quat_off_unit.any())
+    bad_scales = ~torch.isfinite(singular_values) | (singular_values <= 0)
+    bad_scales_any = bool(bad_scales.any())
+    if bad_scales_any:
+        LOGGER.warning(
+            "Repairing %d invalid singular value entries.",
+            int(bad_scales.sum().item()),
+        )
+        singular_values = singular_values.clone()
+        singular_values[bad_scales] = 1e-3
+    if need_quat_fix:
+        identity_quat = torch.tensor(
+            [0.0, 0.0, 0.0, 1.0], device=quaternions.device, dtype=quaternions.dtype
+        )
+        quaternions = torch.where(
+            quat_valid, quaternions / quat_norm.clamp_min(1e-8), identity_quat
+        )
+
+    if need_cast or need_quat_fix or bad_scales_any:
+        gaussians_ndc = Gaussians3D(
+            mean_vectors=mean_vectors,
+            singular_values=singular_values,
+            quaternions=quaternions,
+            colors=colors,
+            opacities=opacities,
+        )
+    else:
+        gaussians_ndc = gaussians_ndc_one
+
+    gaussians_world = None
+    unprojection_matrix = None
+    unprojection_context = None
+    if return_world or return_unprojection:
+        height = aux["height"]
+        width = aux["width"]
+        f_px = aux["f_px"]
+        target_w = aux["target_w"]
+        target_h = aux["target_h"]
+        intrinsics = (
+            torch.tensor(
+                [
+                    [f_px, 0, (width - 1) / 2.0, 0],
+                    [0, f_px, (height - 1) / 2.0, 0],
+                    [0, 0, 1, 0],
+                    [0, 0, 0, 1],
+                ]
+            )
+            .float()
+            .to(device)
+        )
+        intrinsics_resized = intrinsics.clone()
+        intrinsics_resized[0] *= target_w / width
+        intrinsics_resized[1] *= target_h / height
+        unprojection_context = UnprojectionContext(
+            intrinsics_resized=intrinsics_resized,
+            internal_shape=(target_w, target_h),
+            device=device,
+        )
+        if return_unprojection:
+            unprojection_matrix = get_unprojection_matrix(
+                torch.eye(4).to(device), intrinsics_resized, (target_w, target_h)
+            )
+        if return_world:
+            gaussians_world = unproject_gaussians(
+                gaussians_ndc,
+                torch.eye(4).to(device),
+                intrinsics_resized,
+                (target_w, target_h),
+                metrics=aux.get("metrics"),
+            )
+
+    return PredictionResult(
+        pred=gaussians_ndc,
+        world=gaussians_world,
+        unprojection_matrix=unprojection_matrix,
+        unprojection_context=unprojection_context,
+    )
 
 
 def predict_image(
@@ -598,116 +1091,52 @@ def predict_image(
     return_unprojection_context: bool = False,
 ) -> PredictionResult:
     """Predict Gaussians from an image."""
-    internal_shape = (1536, 1536)
+    target_size_wh = (1536, 1536)
 
     LOGGER.info("Running preprocessing.")
     preprocess_start = perf_counter() if metrics else None
-    image_pt = torch.from_numpy(image.copy()).float().to(device).permute(2, 0, 1) / 255.0
-    _, height, width = image_pt.shape
-    disparity_factor = torch.tensor([f_px / width]).float().to(device)
-
-    image_resized_pt = F.interpolate(
-        image_pt[None],
-        size=(internal_shape[1], internal_shape[0]),
-        mode="bilinear",
-        align_corners=True,
+    image_resized_pt, disparity_factor, aux = preprocess_one(
+        image,
+        f_px,
+        device,
+        target_size_wh=target_size_wh,
+        dtype=torch.float32,
     )
+    aux["metrics"] = metrics
     if metrics and preprocess_start is not None:
         metrics.add_time("preprocess", perf_counter() - preprocess_start)
 
-    # Predict Gaussians in the NDC space.
     LOGGER.info("Running inference.")
     forward_start = perf_counter() if metrics else None
-    with torch.inference_mode():
-        if amp_enabled and device.type == "cuda":
-            with torch.autocast(device_type="cuda", dtype=amp_dtype):
-                gaussians_ndc = predictor(image_resized_pt, disparity_factor)
-        else:
-            gaussians_ndc = predictor(image_resized_pt, disparity_factor)
+    # amp_dtype is expected to be resolved by predict_cli (including bf16 fallback).
+    amp_dtype_to_use = amp_dtype if amp_enabled else None
+    gaussians_ndc_batch = model_forward_batch(
+        predictor,
+        image_resized_pt,
+        disparity_factor,
+        amp_dtype=amp_dtype_to_use,
+    )
     if metrics and forward_start is not None:
         metrics.add_time("model_forward", perf_counter() - forward_start)
 
     LOGGER.info("Running postprocessing.")
     postprocess_start = perf_counter() if metrics else None
-    gaussians_ndc = Gaussians3D(
-        mean_vectors=gaussians_ndc.mean_vectors.float(),
-        singular_values=gaussians_ndc.singular_values.float(),
-        quaternions=gaussians_ndc.quaternions.float(),
-        colors=gaussians_ndc.colors.float(),
-        opacities=gaussians_ndc.opacities.float(),
+    gaussians_ndc_one = _slice_gaussians(gaussians_ndc_batch, 0)
+    prediction = postprocess_one(
+        gaussians_ndc_one,
+        aux,
+        return_world=return_world,
+        return_unprojection=return_unprojection or return_unprojection_context,
+        device=device,
     )
-    quaternions = gaussians_ndc.quaternions
-    quat_norm = quaternions.norm(dim=-1, keepdim=True)
-    quat_valid = torch.isfinite(quat_norm) & (quat_norm > 1e-8)
-    identity_quat = torch.tensor(
-        [0.0, 0.0, 0.0, 1.0], device=quaternions.device, dtype=quaternions.dtype
-    )
-    quaternions = torch.where(
-        quat_valid, quaternions / quat_norm.clamp_min(1e-8), identity_quat
-    )
-
-    singular_values = gaussians_ndc.singular_values
-    bad_scales = ~torch.isfinite(singular_values) | (singular_values <= 0)
-    if bad_scales.any():
-        LOGGER.warning(
-            "Repairing %d invalid singular value entries.",
-            int(bad_scales.sum().item()),
-        )
-        singular_values = singular_values.clone()
-        singular_values[bad_scales] = 1e-3
-    gaussians_ndc = Gaussians3D(
-        mean_vectors=gaussians_ndc.mean_vectors,
-        singular_values=singular_values,
-        quaternions=quaternions,
-        colors=gaussians_ndc.colors,
-        opacities=gaussians_ndc.opacities,
-    )
-
-    gaussians_world = None
-    unprojection_matrix = None
-    unprojection_context = None
-    if return_world or return_unprojection or return_unprojection_context:
-        intrinsics = (
-            torch.tensor(
-                [
-                    [f_px, 0, width / 2, 0],
-                    [0, f_px, height / 2, 0],
-                    [0, 0, 1, 0],
-                    [0, 0, 0, 1],
-                ]
-            )
-            .float()
-            .to(device)
-        )
-        intrinsics_resized = intrinsics.clone()
-        intrinsics_resized[0] *= internal_shape[0] / width
-        intrinsics_resized[1] *= internal_shape[1] / height
-        unprojection_context = UnprojectionContext(
-            intrinsics_resized=intrinsics_resized,
-            internal_shape=internal_shape,
-            device=device,
-        )
-        if return_unprojection:
-            unprojection_matrix = get_unprojection_matrix(
-                torch.eye(4).to(device), intrinsics_resized, internal_shape
-            )
-        if return_world:
-            # Convert Gaussians to metrics space.
-            gaussians_world = unproject_gaussians(
-                gaussians_ndc,
-                torch.eye(4).to(device),
-                intrinsics_resized,
-                internal_shape,
-                metrics=metrics,
-            )
     if metrics and postprocess_start is not None:
         metrics.add_time("postprocess", perf_counter() - postprocess_start)
 
     return PredictionResult(
-        pred=gaussians_ndc,
-        world=gaussians_world,
-        unprojection_matrix=unprojection_matrix,
-        unprojection_context=unprojection_context,
+        pred=prediction.pred,
+        world=prediction.world,
+        unprojection_matrix=prediction.unprojection_matrix,
+        unprojection_context=prediction.unprojection_context,
     )
 
 
@@ -782,6 +1211,7 @@ def _log_metrics_summary(metrics: Metrics) -> None:
         "export_world_convert",
         "save_ply",
         "per_image_total",
+        "sbs_async_drain",
         "run_total",
     ]
 
