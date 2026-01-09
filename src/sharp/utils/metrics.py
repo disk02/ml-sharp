@@ -115,7 +115,11 @@ class RenderTiming:
             if not self._logged_gpu_disabled:
                 LOGGER.info("CUDA not available; GPU stage timings disabled.")
                 self._logged_gpu_disabled = True
+            start = perf_counter()
             yield
+            duration = perf_counter() - start
+            if self._current_frame is not None:
+                self._current_frame[stage] = self._current_frame.get(stage, 0.0) + duration
             return
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
@@ -124,20 +128,28 @@ class RenderTiming:
         end_event.record()
         self._pending_gpu_events.setdefault(stage, []).append((start_event, end_event))
 
+    @contextmanager
+    def timed_gpu(self, stage: str) -> Iterator[None]:
+        """Alias for GPU timing to match the CPU/GPU timing API."""
+        with self.gpu_event_timer(stage):
+            yield
+
     def finalize_frame(self) -> None:
-        """Finalize the current frame, syncing once to read GPU event timings."""
+        """Finalize the current frame, syncing on GPU events to read timings."""
         if self._current_frame is None:
             return
         sync_overhead = 0.0
         if self._gpu_enabled and any(self._pending_gpu_events.values()):
-            sync_start = perf_counter()
-            torch.cuda.synchronize()
-            sync_overhead = perf_counter() - sync_start
             for stage, events in self._pending_gpu_events.items():
                 for start_event, end_event in events:
+                    # Render sync overhead tracks CPU wait time for GPU event completion.
+                    sync_start = perf_counter()
+                    end_event.synchronize()
+                    sync_overhead += perf_counter() - sync_start
                     duration = start_event.elapsed_time(end_event) / 1000.0
                     self._current_frame[stage] = self._current_frame.get(stage, 0.0) + duration
         if sync_overhead > 0.0:
+            # The remainder represents unavoidable waiting on GPU work to finish before readback.
             self._current_frame["render_sync_overhead"] += sync_overhead
 
         encode_total = sum(self._current_frame.get(stage, 0.0) for stage in self.encode_stages)
