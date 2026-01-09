@@ -37,7 +37,7 @@ def write_renderings(rendering: RenderingOutputs, output_folder: Path, filename:
         np_array = tensor.permute(1, 2, 0).numpy()
         io.save_image(np_array, (output_folder / filename).with_suffix(suffix))
 
-    color = (rendering.color[0].cpu() * 255.0).to(dtype=torch.uint8)
+    color = (rendering.color[0] * 255.0).to(dtype=torch.uint8).cpu()
     colorized_depth = vis.colorize_depth(rendering.depth[0], val_max=100.0)
     colorized_alpha = vis.colorize_alpha(rendering.alpha[0])
 
@@ -77,6 +77,7 @@ class GSplatRenderer(nn.Module):
         intrinsics: torch.Tensor,
         image_width: int,
         image_height: int,
+        want_depth: bool = True,
         render_timing: RenderTiming | None = None,
     ) -> RenderingOutputs:
         """Predict images from gaussians.
@@ -87,11 +88,13 @@ class GSplatRenderer(nn.Module):
             intrinsics: The intriniscs of the camera to render to in OpenCV format.
             image_width: The desired output image width.
             image_height: The desired output image height.
+            want_depth: Whether to render depth alongside RGB.
         """
         batch_size = len(gaussians.mean_vectors)
         outputs_list: list[RenderingOutputs] = []
 
         for ib in range(batch_size):
+            render_mode = "RGB+D" if want_depth else "RGB"
             if render_timing is None:
                 colors, alphas, meta = gsplat.rendering.rasterization(
                     means=gaussians.mean_vectors[ib],
@@ -103,7 +106,7 @@ class GSplatRenderer(nn.Module):
                     Ks=intrinsics[ib : ib + 1, :3, :3],
                     width=image_width,
                     height=image_height,
-                    render_mode="RGB+D",
+                    render_mode=render_mode,
                     rasterize_mode="classic",
                     absgrad=False,
                     packed=False,
@@ -122,7 +125,7 @@ class GSplatRenderer(nn.Module):
                         Ks=intrinsics[ib : ib + 1, :3, :3],
                         width=image_width,
                         height=image_height,
-                        render_mode="RGB+D",
+                        render_mode=render_mode,
                         rasterize_mode="classic",
                         absgrad=False,
                         packed=False,
@@ -130,7 +133,6 @@ class GSplatRenderer(nn.Module):
                     )
 
             rendered_color = colors[..., 0:3].permute([0, 3, 1, 2])
-            rendered_depth_unnormalized = colors[..., 3:4].permute([0, 3, 1, 2])
             rendered_alpha = alphas.permute([0, 3, 1, 2])
 
             # GPU shading covers background composition and colorspace conversion.
@@ -158,18 +160,8 @@ class GSplatRenderer(nn.Module):
 
             # GPU raster/blend stage includes post-raster depth normalization work.
             if render_timing is None:
-                # splats: (B, N, 10)
-                cov2d = self._conics_to_covars2d(meta["conics"])
-                # Set the cov2d of invisible splats to 1 to avoid nan in condition number calculation..
-                splats_visible_mask = meta["depths"] > 1e-2
-                cov2d[~splats_visible_mask][..., 0, 0] = 1
-                cov2d[~splats_visible_mask][..., 1, 1] = 1
-                cov2d[~splats_visible_mask][..., 0, 1] = 0
-
-                # Normalize the depth by alpha.
-                rendered_depth = rendered_depth_unnormalized / torch.clip(rendered_alpha, min=1e-8)
-            else:
-                with render_timing.gpu_event_timer("render_gpu_raster_blend"):
+                if want_depth:
+                    rendered_depth_unnormalized = colors[..., 3:4].permute([0, 3, 1, 2])
                     cov2d = self._conics_to_covars2d(meta["conics"])
                     splats_visible_mask = meta["depths"] > 1e-2
                     cov2d[~splats_visible_mask][..., 0, 0] = 1
@@ -178,6 +170,32 @@ class GSplatRenderer(nn.Module):
                     rendered_depth = rendered_depth_unnormalized / torch.clip(
                         rendered_alpha, min=1e-8
                     )
+                else:
+                    rendered_depth = rendered_color.new_empty(
+                        rendered_color.shape[0],
+                        1,
+                        rendered_color.shape[2],
+                        rendered_color.shape[3],
+                    )
+            else:
+                with render_timing.gpu_event_timer("render_gpu_raster_blend"):
+                    if want_depth:
+                        rendered_depth_unnormalized = colors[..., 3:4].permute([0, 3, 1, 2])
+                        cov2d = self._conics_to_covars2d(meta["conics"])
+                        splats_visible_mask = meta["depths"] > 1e-2
+                        cov2d[~splats_visible_mask][..., 0, 0] = 1
+                        cov2d[~splats_visible_mask][..., 1, 1] = 1
+                        cov2d[~splats_visible_mask][..., 0, 1] = 0
+                        rendered_depth = rendered_depth_unnormalized / torch.clip(
+                            rendered_alpha, min=1e-8
+                        )
+                    else:
+                        rendered_depth = rendered_color.new_empty(
+                            rendered_color.shape[0],
+                            1,
+                            rendered_color.shape[2],
+                            rendered_color.shape[3],
+                        )
 
             outputs = RenderingOutputs(
                 color=rendered_color,

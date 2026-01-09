@@ -122,6 +122,8 @@ def render_gaussians(
 
     # If only rendering SBS image, don't create video writer
     video_writer = io.VideoWriter(output_path) if sbs_image_path is None else None
+    # SBS images don't use depth, so skip depth rendering when no video output is requested.
+    want_depth = video_writer is not None
 
     for frame_idx, eye_mid in enumerate(trajectory):
         if metrics:
@@ -182,6 +184,7 @@ def render_gaussians(
             intrinsics=intrinsics_l,
             image_width=camera_info_l.width,
             image_height=camera_info_l.height,
+            want_depth=want_depth,
             render_timing=render_timing,
         )
 
@@ -192,6 +195,7 @@ def render_gaussians(
             intrinsics=intrinsics_r,
             image_width=camera_info_r.width,
             image_height=camera_info_r.height,
+            want_depth=want_depth,
             render_timing=render_timing,
         )
 
@@ -200,22 +204,22 @@ def render_gaussians(
                 color_l = (rendering_output_l.color[0].permute(1, 2, 0) * 255.0).to(
                     dtype=torch.uint8
                 )
-                depth_l = rendering_output_l.depth[0]
                 color_r = (rendering_output_r.color[0].permute(1, 2, 0) * 255.0).to(
                     dtype=torch.uint8
                 )
-                depth_r = rendering_output_r.depth[0]
+                depth_l = rendering_output_l.depth[0] if want_depth else None
+                depth_r = rendering_output_r.depth[0] if want_depth else None
                 # Pack the left and right views into SBS format.
                 color = torch.cat((color_l, color_r), dim=1)
         else:
             color_l = (rendering_output_l.color[0].permute(1, 2, 0) * 255.0).to(
                 dtype=torch.uint8
             )
-            depth_l = rendering_output_l.depth[0]
             color_r = (rendering_output_r.color[0].permute(1, 2, 0) * 255.0).to(
                 dtype=torch.uint8
             )
-            depth_r = rendering_output_r.depth[0]
+            depth_l = rendering_output_l.depth[0] if want_depth else None
+            depth_r = rendering_output_r.depth[0] if want_depth else None
             color = torch.cat((color_l, color_r), dim=1)
 
         # Write SBS frame image if requested
@@ -247,7 +251,10 @@ def render_gaussians(
                             color_l_np, color_r_np, params=align_params
                         )
 
-                    color_sbs_np = np.concatenate((color_l_np, color_r_np), axis=1)
+                    height, width, _channels = color_l_np.shape
+                    color_sbs_np = np.empty((height, width * 2, 3), dtype=np.uint8)
+                    color_sbs_np[:, :width, :] = color_l_np
+                    color_sbs_np[:, width:, :] = color_r_np
                     img = (
                         color_sbs_np
                         if sbs_async_writer is not None
@@ -277,7 +284,10 @@ def render_gaussians(
                         color_l_np, color_r_np, params=align_params
                     )
 
-                color_sbs_np = np.concatenate((color_l_np, color_r_np), axis=1)
+                height, width, _channels = color_l_np.shape
+                color_sbs_np = np.empty((height, width * 2, 3), dtype=np.uint8)
+                color_sbs_np[:, :width, :] = color_l_np
+                color_sbs_np[:, width:, :] = color_r_np
                 img = (
                     color_sbs_np
                     if sbs_async_writer is not None
@@ -392,6 +402,8 @@ def render_gaussians_pred_space(
     render_timing = metrics.render_timing if metrics else None
 
     video_writer = io.VideoWriter(output_path) if sbs_image_path is None else None
+    # SBS images don't use depth, so skip depth rendering when no video output is requested.
+    want_depth = video_writer is not None
 
     for frame_idx, eye_mid in enumerate(trajectory):
         if metrics:
@@ -450,6 +462,7 @@ def render_gaussians_pred_space(
             intrinsics=intrinsics_l,
             image_width=camera_info_l.width,
             image_height=camera_info_l.height,
+            want_depth=want_depth,
             render_timing=render_timing,
         )
 
@@ -459,6 +472,7 @@ def render_gaussians_pred_space(
             intrinsics=intrinsics_r,
             image_width=camera_info_r.width,
             image_height=camera_info_r.height,
+            want_depth=want_depth,
             render_timing=render_timing,
         )
 
@@ -467,21 +481,21 @@ def render_gaussians_pred_space(
                 color_l = (rendering_output_l.color[0].permute(1, 2, 0) * 255.0).to(
                     dtype=torch.uint8
                 )
-                depth_l = rendering_output_l.depth[0]
                 color_r = (rendering_output_r.color[0].permute(1, 2, 0) * 255.0).to(
                     dtype=torch.uint8
                 )
-                depth_r = rendering_output_r.depth[0]
+                depth_l = rendering_output_l.depth[0] if want_depth else None
+                depth_r = rendering_output_r.depth[0] if want_depth else None
                 color = torch.cat((color_l, color_r), dim=1)
         else:
             color_l = (rendering_output_l.color[0].permute(1, 2, 0) * 255.0).to(
                 dtype=torch.uint8
             )
-            depth_l = rendering_output_l.depth[0]
             color_r = (rendering_output_r.color[0].permute(1, 2, 0) * 255.0).to(
                 dtype=torch.uint8
             )
-            depth_r = rendering_output_r.depth[0]
+            depth_l = rendering_output_l.depth[0] if want_depth else None
+            depth_r = rendering_output_r.depth[0] if want_depth else None
             color = torch.cat((color_l, color_r), dim=1)
 
         if sbs_image_path is not None and frame_idx == sbs_image_frame:
@@ -509,7 +523,10 @@ def render_gaussians_pred_space(
                             color_l_np, color_r_np, params=align_params
                         )
 
-                    color_sbs_np = np.concatenate((color_l_np, color_r_np), axis=1)
+                    height, width, _channels = color_l_np.shape
+                    color_sbs_np = np.empty((height, width * 2, 3), dtype=np.uint8)
+                    color_sbs_np[:, :width, :] = color_l_np
+                    color_sbs_np[:, width:, :] = color_r_np
                     img = (
                         color_sbs_np
                         if sbs_async_writer is not None
@@ -539,7 +556,10 @@ def render_gaussians_pred_space(
                         color_l_np, color_r_np, params=align_params
                     )
 
-                color_sbs_np = np.concatenate((color_l_np, color_r_np), axis=1)
+                height, width, _channels = color_l_np.shape
+                color_sbs_np = np.empty((height, width * 2, 3), dtype=np.uint8)
+                color_sbs_np[:, :width, :] = color_l_np
+                color_sbs_np[:, width:, :] = color_r_np
                 img = (
                     color_sbs_np
                     if sbs_async_writer is not None
