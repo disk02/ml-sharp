@@ -890,10 +890,14 @@ def predict_cli(
                     )
                     if aux.get("highlight_rolloff_applied"):
                         LOGGER.info(
-                            "Highlight rolloff enabled (sat_frac=%.6f, threshold=%.6f): %s",
-                            aux.get("highlight_sat_frac", 0.0),
-                            aux.get("highlight_sat_frac_threshold", 0.0),
+                            "Highlight rolloff enabled [trigger=%s] for %s (white_frac=%.6f, "
+                            "sat_frac=%.6f; white_thr=%.6f, sat_fallback=%.6f)",
+                            aux.get("highlight_rolloff_trigger", "unknown"),
                             image_path,
+                            aux.get("highlight_white_frac", 0.0),
+                            aux.get("highlight_sat_frac", 0.0),
+                            aux.get("highlight_white_frac_threshold", 0.0),
+                            aux.get("highlight_sat_frac_fallback_threshold", 0.0),
                         )
                     aux["metrics"] = metrics
                     preprocess_elapsed = 0.0
@@ -1018,15 +1022,28 @@ def preprocess_one(
     image_pt = torch.from_numpy(image_np).to(dtype=dtype, device=device).permute(2, 0, 1)
     image_pt = image_pt / 255.0
     sat_threshold = 0.98
-    sat_frac_threshold = 0.001
+    white_threshold = 0.98
+    chroma_threshold = 0.08
+    white_frac_threshold = 0.01
+    sat_frac_fallback_threshold = 0.30
     knee_start = 0.98
     rolloff_strength = 4.0
     max_rgb = image_pt.max(dim=0).values
+    min_rgb = image_pt.min(dim=0).values
+    chroma = max_rgb - min_rgb
     sat_mask = max_rgb >= sat_threshold
-    sat_frac_pt = sat_mask.float().mean()
-    sat_frac = float(sat_frac_pt.item())
+    white_mask = (min_rgb >= white_threshold) & (chroma <= chroma_threshold)
+    sat_frac = float(sat_mask.float().mean().item())
+    white_frac = float(white_mask.float().mean().item())
     highlight_rolloff_applied = False
-    if sat_frac >= sat_frac_threshold:
+    highlight_rolloff_trigger = "none"
+    if white_frac >= white_frac_threshold:
+        highlight_rolloff_applied = True
+        highlight_rolloff_trigger = "white"
+    elif sat_frac >= sat_frac_fallback_threshold:
+        highlight_rolloff_applied = True
+        highlight_rolloff_trigger = "sat_fallback"
+    if highlight_rolloff_applied:
         knee_start_pt = torch.tensor(knee_start, dtype=image_pt.dtype, device=image_pt.device)
         one_minus_knee = torch.tensor(
             1.0 - knee_start, dtype=image_pt.dtype, device=image_pt.device
@@ -1040,7 +1057,6 @@ def preprocess_one(
         )
         image_pt = torch.where(image_pt > knee_start_pt, rolloff, image_pt)
         image_pt = image_pt.clamp(0.0, 1.0)
-        highlight_rolloff_applied = True
     _, height, width = image_pt.shape
     disparity_factor_pt = torch.tensor([f_px / width], dtype=dtype, device=device)
     image_resized_pt = F.interpolate(
@@ -1063,8 +1079,14 @@ def preprocess_one(
         "target_w": target_w,
         "target_h": target_h,
         "highlight_rolloff_applied": highlight_rolloff_applied,
+        "highlight_rolloff_trigger": highlight_rolloff_trigger,
         "highlight_sat_frac": sat_frac,
-        "highlight_sat_frac_threshold": sat_frac_threshold,
+        "highlight_white_frac": white_frac,
+        "highlight_sat_threshold": sat_threshold,
+        "highlight_white_threshold": white_threshold,
+        "highlight_chroma_threshold": chroma_threshold,
+        "highlight_white_frac_threshold": white_frac_threshold,
+        "highlight_sat_frac_fallback_threshold": sat_frac_fallback_threshold,
     }
     return image_resized_pt, disparity_factor_pt, aux
 
@@ -1239,10 +1261,14 @@ def predict_image(
     )
     if aux.get("highlight_rolloff_applied"):
         LOGGER.info(
-            "Highlight rolloff enabled (sat_frac=%.6f, threshold=%.6f): %s",
-            aux.get("highlight_sat_frac", 0.0),
-            aux.get("highlight_sat_frac_threshold", 0.0),
+            "Highlight rolloff enabled [trigger=%s] for %s (white_frac=%.6f, sat_frac=%.6f; "
+            "white_thr=%.6f, sat_fallback=%.6f)",
+            aux.get("highlight_rolloff_trigger", "unknown"),
             "<single image>",
+            aux.get("highlight_white_frac", 0.0),
+            aux.get("highlight_sat_frac", 0.0),
+            aux.get("highlight_white_frac_threshold", 0.0),
+            aux.get("highlight_sat_frac_fallback_threshold", 0.0),
         )
     aux["metrics"] = metrics
     if metrics and preprocess_start is not None:
