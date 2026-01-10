@@ -888,6 +888,13 @@ def predict_cli(
                         target_size_wh=(1536, 1536),
                         dtype=torch.float32,
                     )
+                    if aux.get("highlight_rolloff_applied"):
+                        LOGGER.info(
+                            "Highlight rolloff enabled (sat_frac=%.6f, threshold=%.6f): %s",
+                            aux.get("highlight_sat_frac", 0.0),
+                            aux.get("highlight_sat_frac_threshold", 0.0),
+                            image_path,
+                        )
                     aux["metrics"] = metrics
                     preprocess_elapsed = 0.0
                     if metrics and preprocess_start is not None:
@@ -1010,6 +1017,30 @@ def preprocess_one(
         image_np = image_np.copy()
     image_pt = torch.from_numpy(image_np).to(dtype=dtype, device=device).permute(2, 0, 1)
     image_pt = image_pt / 255.0
+    sat_threshold = 0.98
+    sat_frac_threshold = 0.001
+    knee_start = 0.98
+    rolloff_strength = 4.0
+    max_rgb = image_pt.max(dim=0).values
+    sat_mask = max_rgb >= sat_threshold
+    sat_frac_pt = sat_mask.float().mean()
+    sat_frac = float(sat_frac_pt.item())
+    highlight_rolloff_applied = False
+    if sat_frac >= sat_frac_threshold:
+        knee_start_pt = torch.tensor(knee_start, dtype=image_pt.dtype, device=image_pt.device)
+        one_minus_knee = torch.tensor(
+            1.0 - knee_start, dtype=image_pt.dtype, device=image_pt.device
+        )
+        rolloff_strength_pt = torch.tensor(
+            rolloff_strength, dtype=image_pt.dtype, device=image_pt.device
+        )
+        normalized = (image_pt - knee_start_pt) / one_minus_knee
+        rolloff = knee_start_pt + one_minus_knee * (
+            1.0 - torch.exp(-rolloff_strength_pt * normalized)
+        )
+        image_pt = torch.where(image_pt > knee_start_pt, rolloff, image_pt)
+        image_pt = image_pt.clamp(0.0, 1.0)
+        highlight_rolloff_applied = True
     _, height, width = image_pt.shape
     disparity_factor_pt = torch.tensor([f_px / width], dtype=dtype, device=device)
     image_resized_pt = F.interpolate(
@@ -1031,6 +1062,9 @@ def preprocess_one(
         "f_px": f_px,
         "target_w": target_w,
         "target_h": target_h,
+        "highlight_rolloff_applied": highlight_rolloff_applied,
+        "highlight_sat_frac": sat_frac,
+        "highlight_sat_frac_threshold": sat_frac_threshold,
     }
     return image_resized_pt, disparity_factor_pt, aux
 
@@ -1203,6 +1237,13 @@ def predict_image(
         target_size_wh=target_size_wh,
         dtype=torch.float32,
     )
+    if aux.get("highlight_rolloff_applied"):
+        LOGGER.info(
+            "Highlight rolloff enabled (sat_frac=%.6f, threshold=%.6f): %s",
+            aux.get("highlight_sat_frac", 0.0),
+            aux.get("highlight_sat_frac_threshold", 0.0),
+            "<single image>",
+        )
     aux["metrics"] = metrics
     if metrics and preprocess_start is not None:
         metrics.add_time("preprocess", perf_counter() - preprocess_start)
