@@ -45,6 +45,144 @@ class Gaussians3D(NamedTuple):
         )
 
 
+PruneScore = Literal["opacity", "opacity_scale"]
+
+
+@torch.no_grad()
+def prune_gaussians(
+    gaussians: Gaussians3D,
+    *,
+    min_opacity: float = 0.0,
+    min_scale: float = 0.0,
+    max_splats: int | None = None,
+    score: PruneScore = "opacity_scale",
+) -> Gaussians3D:
+    """Prune Gaussians by opacity/scale thresholds and optional top-K scoring.
+
+    Batched inputs keep rectangular output by prioritizing splats that pass thresholds
+    and filling remaining slots by score order.
+    """
+    if min_opacity == 0.0 and min_scale == 0.0 and max_splats is None:
+        return gaussians
+    if score not in ("opacity", "opacity_scale"):
+        raise ValueError(f"Unsupported prune score: {score}")
+    if max_splats is not None and max_splats < 1:
+        raise ValueError("max_splats must be >= 1 when provided.")
+
+    opacities = gaussians.opacities
+    if opacities.ndim > 1 and opacities.shape[-1] == 1:
+        opacities = opacities.squeeze(-1)
+    max_scale = gaussians.singular_values.max(dim=-1).values
+
+    def _scores(opacity_vals: torch.Tensor, scale_vals: torch.Tensor) -> torch.Tensor:
+        if score == "opacity":
+            return opacity_vals
+        return opacity_vals * scale_vals
+
+    def _select_unbatched(
+        gaussians_in: Gaussians3D, opacities_in: torch.Tensor, max_scale_in: torch.Tensor
+    ) -> Gaussians3D:
+        mask = (opacities_in >= min_opacity) & (max_scale_in >= min_scale)
+        scores = _scores(opacities_in, max_scale_in)
+        if mask.any():
+            candidate_idx = mask.nonzero(as_tuple=False).flatten()
+        else:
+            LOGGER.warning(
+                "All splats pruned; keeping the best-scoring splat to avoid empty render."
+            )
+            candidate_idx = scores.argmax().view(1)
+
+        if max_splats is not None:
+            k = min(max_splats, int(candidate_idx.numel()))
+            topk = torch.topk(scores[candidate_idx], k=k).indices
+            candidate_idx = candidate_idx[topk]
+
+        def _index(tensor: torch.Tensor) -> torch.Tensor:
+            return tensor.index_select(0, candidate_idx)
+
+        return Gaussians3D(
+            mean_vectors=_index(gaussians_in.mean_vectors),
+            singular_values=_index(gaussians_in.singular_values),
+            quaternions=_index(gaussians_in.quaternions),
+            colors=_index(gaussians_in.colors),
+            opacities=_index(gaussians_in.opacities),
+        )
+
+    if gaussians.mean_vectors.ndim == 2:
+        return _select_unbatched(gaussians, opacities, max_scale)
+    if gaussians.mean_vectors.shape[0] == 1:
+        squeezed = Gaussians3D(
+            mean_vectors=gaussians.mean_vectors[0],
+            singular_values=gaussians.singular_values[0],
+            quaternions=gaussians.quaternions[0],
+            colors=gaussians.colors[0],
+            opacities=gaussians.opacities[0],
+        )
+        pruned = _select_unbatched(
+            squeezed,
+            opacities[0],
+            max_scale[0],
+        )
+        return Gaussians3D(
+            mean_vectors=pruned.mean_vectors.unsqueeze(0),
+            singular_values=pruned.singular_values.unsqueeze(0),
+            quaternions=pruned.quaternions.unsqueeze(0),
+            colors=pruned.colors.unsqueeze(0),
+            opacities=pruned.opacities.unsqueeze(0),
+        )
+
+    batch_size, num_splats = gaussians.mean_vectors.shape[:2]
+    scores_batched = _scores(opacities, max_scale)
+    target_count = num_splats
+    if max_splats is not None:
+        target_count = min(target_count, max_splats)
+    target_count = max(target_count, 1)
+
+    def _select_indices(batch: int) -> torch.Tensor:
+        mask = (opacities[batch] >= min_opacity) & (max_scale[batch] >= min_scale)
+        scores = scores_batched[batch]
+        kept_idx = mask.nonzero(as_tuple=False).flatten()
+        dropped_idx = (~mask).nonzero(as_tuple=False).flatten()
+        if kept_idx.numel() == 0:
+            LOGGER.warning(
+                "All splats pruned for batch %d; keeping the best-scoring splat.",
+                batch,
+            )
+        if kept_idx.numel():
+            kept_order = torch.argsort(scores[kept_idx], descending=True)
+        else:
+            kept_order = kept_idx
+        if dropped_idx.numel():
+            drop_order = torch.argsort(scores[dropped_idx], descending=True)
+        else:
+            drop_order = dropped_idx
+        ordered = torch.cat(
+            (
+                kept_idx[kept_order] if kept_idx.numel() else kept_idx,
+                dropped_idx[drop_order] if dropped_idx.numel() else dropped_idx,
+            ),
+            dim=0,
+        )
+        if ordered.numel() == 0:
+            ordered = scores.argmax().view(1)
+        return ordered[:target_count]
+
+    def _gather_field(tensor: torch.Tensor) -> torch.Tensor:
+        gathered: list[torch.Tensor] = []
+        for batch in range(batch_size):
+            chosen = _select_indices(batch)
+            gathered.append(tensor[batch].index_select(0, chosen))
+        return torch.stack(gathered, dim=0)
+
+    return Gaussians3D(
+        mean_vectors=_gather_field(gaussians.mean_vectors),
+        singular_values=_gather_field(gaussians.singular_values),
+        quaternions=_gather_field(gaussians.quaternions),
+        colors=_gather_field(gaussians.colors),
+        opacities=_gather_field(gaussians.opacities),
+    )
+
+
 class SceneMetaData(NamedTuple):
     """Meta data about Gaussian scene."""
 
