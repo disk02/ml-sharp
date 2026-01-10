@@ -21,7 +21,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.utils.data
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 from sharp.models import (
     PredictorParams,
@@ -748,7 +748,11 @@ def predict_cli(
                 out_dir.mkdir(parents=True, exist_ok=True)
                 LOGGER.info("Processing %s (%d/%d)", image_path, index, len(image_paths))
                 io_start = perf_counter()
-                image, _, f_px = io.load_rgb(image_path)
+                try:
+                    image, _, f_px = io.load_rgb(image_path)
+                except (OSError, UnidentifiedImageError, ValueError) as exc:
+                    LOGGER.warning("Skipping unreadable image %s: %s", image_path, exc)
+                    continue
                 metrics.add_time("io_decode", perf_counter() - io_start)
                 height, width = image.shape[:2]
                 intrinsics = torch.tensor(
@@ -829,7 +833,11 @@ def predict_cli(
                     out_dir.mkdir(parents=True, exist_ok=True)
                     LOGGER.info("Processing %s (%d/%d)", image_path, index, total_images)
                     io_start = perf_counter()
-                    image, _, f_px = io.load_rgb(image_path)
+                    try:
+                        image, _, f_px = io.load_rgb(image_path)
+                    except (OSError, UnidentifiedImageError, ValueError) as exc:
+                        LOGGER.warning("Skipping unreadable image %s: %s", image_path, exc)
+                        continue
                     metrics.add_time("io_decode", perf_counter() - io_start)
                     height, width = image.shape[:2]
                     intrinsics = torch.tensor(
@@ -904,6 +912,8 @@ def predict_cli(
                         }
                     )
 
+                if not batch_items:
+                    continue
                 image_resized_batch = torch.cat(
                     [item["image_resized_pt"] for item in batch_items], dim=0
                 )
