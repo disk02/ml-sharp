@@ -44,14 +44,23 @@ class GeoCalibRunner:
     def __post_init__(self) -> None:
         from geocalib import GeoCalib
 
-        self._model = GeoCalib(device=self.device)
+        self._model = GeoCalib()
+        if hasattr(self._model, "to"):
+            self._model = self._model.to(self.device)
 
     def calibrate_image(self, image_path: Path) -> float:
         image = self._model.load_image(str(image_path))
+        if hasattr(image, "to"):
+            image = image.to(self.device)
         calibration = self._model.calibrate(image)
         return _extract_f_px(calibration)
 
     def calibrate_folder(self, image_paths: list[Path]) -> float:
-        images = [self._model.load_image(str(path)) for path in image_paths]
+        images = []
+        for path in image_paths:
+            image = self._model.load_image(str(path))
+            if hasattr(image, "to"):
+                image = image.to(self.device)
+            images.append(image)
         calibration = self._model.calibrate(images, shared_intrinsics=True)
         return _extract_f_px(calibration)
