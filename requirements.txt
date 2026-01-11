@@ -26,6 +26,7 @@ fsspec==2025.9.0
     # via
     #   huggingface-hub
     #   torch
+geocalib @ git+https://github.com/cvg/GeoCalib.git
 gsplat==1.5.3
     # via sharp
 hf-xet==1.1.10 ; platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'arm64' or platform_machine == 'x86_64'

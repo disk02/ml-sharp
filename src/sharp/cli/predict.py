@@ -346,6 +346,18 @@ def _align_for_compare(
     help="Compute PLY export conversions in fp32 (even if inference uses AMP).",
 )
 @click.option(
+    "--geocalib",
+    is_flag=True,
+    default=False,
+    help="Enable GeoCalib focal length estimation.",
+)
+@click.option(
+    "--geocalib-per-folder",
+    is_flag=True,
+    default=False,
+    help="Run GeoCalib once per folder and reuse for images in that folder.",
+)
+@click.option(
     "--device",
     type=str,
     default="default",
@@ -398,6 +410,8 @@ def predict_cli(
     skip_world_conversion: bool,
     defer_world_conversion_for_export: bool,
     export_fp32: bool,
+    geocalib: bool,
+    geocalib_per_folder: bool,
     device: str,
     amp: bool | None,
     amp_dtype: str,
@@ -425,6 +439,9 @@ def predict_cli(
         return
     if batch_size < 1:
         raise click.ClickException("--batch-size must be >= 1.")
+    if geocalib_per_folder and not geocalib:
+        LOGGER.warning("--geocalib-per-folder ignored because --geocalib was not set.")
+        geocalib_per_folder = False
 
     def _natural_sort_key(path: Path) -> list[tuple[int, object]]:
         relative_path = path.relative_to(input_path).as_posix()
@@ -483,6 +500,30 @@ def predict_cli(
     if with_rendering and device != "cuda":
         LOGGER.warning("Can only run rendering with gsplat on CUDA. Rendering is disabled.")
         with_rendering = False
+
+    geocalib_runner = None
+    folder_fpx_cache: dict[Path, float] = {}
+    if geocalib:
+        from sharp.utils.geocalib import GeoCalibRunner
+
+        geocalib_device = torch.device("cpu" if device == "mps" else device)
+        geocalib_runner = GeoCalibRunner(geocalib_device)
+        if geocalib_per_folder and input_is_dir:
+            folder_map: dict[Path, list[Path]] = {}
+            for path in image_paths:
+                folder_map.setdefault(path.parent, []).append(path)
+            for folder, folder_images in folder_map.items():
+                try:
+                    f_px_folder = geocalib_runner.calibrate_folder(folder_images)
+                except Exception as exc:  # pragma: no cover - best-effort fallback
+                    LOGGER.warning(
+                        "GeoCalib folder calibration failed for %s: %s. Falling back to EXIF/default.",
+                        folder,
+                        exc,
+                    )
+                    continue
+                folder_fpx_cache[folder] = f_px_folder
+                LOGGER.info("GeoCalib folder focal computed: %s -> %.2f", folder, f_px_folder)
 
     # Load or download checkpoint
     if checkpoint_path is None:
@@ -738,6 +779,21 @@ def predict_cli(
                 LOGGER.info("Skipping .ply save because --no-save-ply was requested.")
         metrics.add_time("per_image_total", perf_counter() - image_start)
 
+    def _resolve_f_px(image_path: Path, f_px_exif: float) -> float:
+        if geocalib_runner is None:
+            return f_px_exif
+        if geocalib_per_folder and input_is_dir:
+            return folder_fpx_cache.get(image_path.parent, f_px_exif)
+        try:
+            return geocalib_runner.calibrate_image(image_path)
+        except Exception as exc:  # pragma: no cover - best-effort fallback
+            LOGGER.warning(
+                "GeoCalib failed for %s: %s. Falling back to EXIF/default.",
+                image_path,
+                exc,
+            )
+            return f_px_exif
+
     run_start = perf_counter()
     try:
         if batch_size <= 1 or len(image_paths) == 1:
@@ -749,11 +805,12 @@ def predict_cli(
                 LOGGER.info("Processing %s (%d/%d)", image_path, index, len(image_paths))
                 io_start = perf_counter()
                 try:
-                    image, _, f_px = io.load_rgb(image_path)
+                    image, _, f_px_exif = io.load_rgb(image_path)
                 except (OSError, UnidentifiedImageError, ValueError) as exc:
                     LOGGER.warning("Skipping unreadable image %s: %s", image_path, exc)
                     continue
                 metrics.add_time("io_decode", perf_counter() - io_start)
+                f_px = _resolve_f_px(image_path, f_px_exif)
                 height, width = image.shape[:2]
                 intrinsics = torch.tensor(
                     [
@@ -834,11 +891,12 @@ def predict_cli(
                     LOGGER.info("Processing %s (%d/%d)", image_path, index, total_images)
                     io_start = perf_counter()
                     try:
-                        image, _, f_px = io.load_rgb(image_path)
+                        image, _, f_px_exif = io.load_rgb(image_path)
                     except (OSError, UnidentifiedImageError, ValueError) as exc:
                         LOGGER.warning("Skipping unreadable image %s: %s", image_path, exc)
                         continue
                     metrics.add_time("io_decode", perf_counter() - io_start)
+                    f_px = _resolve_f_px(image_path, f_px_exif)
                     height, width = image.shape[:2]
                     intrinsics = torch.tensor(
                         [
