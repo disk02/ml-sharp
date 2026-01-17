@@ -541,12 +541,6 @@ def predict_cli(
     if want_render_trajectory or want_sbs_image or fast_preview_render or fast_preview_compare:
         metrics.render_timing = RenderTiming()
 
-    # Allow SBS baseline customization to match capture rigs while keeping a safe disparity range.
-    if want_sbs_image and not 0.05 <= stereo_strength <= 0.07:
-        raise click.ClickException(
-            "--stereo-strength must be between 0.05 and 0.07 (world units)."
-        )
-
     sbs_async_writer: AsyncImageWriter | None = None
     if want_sbs_image and not fast_preview_compare:
         sbs_async_writer = AsyncImageWriter()
