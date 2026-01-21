@@ -276,6 +276,33 @@ def _align_for_compare(
     help="Render SBS preview using predicted-space gaussians (skips world conversion).",
 )
 @click.option(
+    "--tiling",
+    is_flag=True,
+    default=False,
+    help="Enable tiled inference mode (requires --sbs-image and --fast-preview-render).",
+)
+@click.option(
+    "--tile-size",
+    type=int,
+    default=1536,
+    show_default=True,
+    help="Nominal tile size in pixels (square tiles assumed).",
+)
+@click.option(
+    "--tile-overlap",
+    type=float,
+    default=0.25,
+    show_default=True,
+    help="Fractional overlap between tiles in [0.0, 0.5).",
+)
+@click.option(
+    "--tile-keep",
+    type=float,
+    default=None,
+    show_default=True,
+    help="Optional keep region fraction for tiles (defaults to derive from overlap).",
+)
+@click.option(
     "--sbs-min-opacity",
     type=float,
     default=0.0,
@@ -389,6 +416,10 @@ def predict_cli(
     sbs_image_frame: int,
     stereo_strength: float,
     fast_preview_render: bool,
+    tiling: bool,
+    tile_size: int,
+    tile_overlap: float,
+    tile_keep: float | None,
     sbs_min_opacity: float,
     sbs_min_scale: float,
     sbs_max_splats: int | None,
@@ -426,6 +457,14 @@ def predict_cli(
         return
     if batch_size < 1:
         raise click.ClickException("--batch-size must be >= 1.")
+    if tiling and (sbs_image is None or not fast_preview_render):
+        raise click.ClickException(
+            "--tiling is only supported with --sbs-image and --fast-preview-render."
+        )
+    if tile_overlap < 0.0 or tile_overlap >= 0.5:
+        raise click.ClickException("--tile-overlap must be in [0.0, 0.5).")
+    if tile_keep is not None and (tile_keep <= 0.0 or tile_keep > 1.0):
+        raise click.ClickException("--tile-keep must be in (0.0, 1.0].")
 
     def _natural_sort_key(path: Path) -> list[tuple[int, object]]:
         relative_path = path.relative_to(input_path).as_posix()
