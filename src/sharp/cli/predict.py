@@ -1003,7 +1003,12 @@ def preprocess_one(
     image_np = np.ascontiguousarray(image_np)
     if not image_np.flags.writeable:
         image_np = image_np.copy()
-    image_pt = torch.from_numpy(image_np).to(dtype=dtype, device=device).permute(2, 0, 1)
+    image_pt = (
+        torch.from_numpy(image_np)
+        .permute(2, 0, 1)
+        .contiguous()
+        .to(device=device, dtype=dtype)
+    )
     image_pt = image_pt / 255.0
     _, height, width = image_pt.shape
     disparity_factor_pt = torch.tensor([f_px / width], dtype=dtype, device=device)
