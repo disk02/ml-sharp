@@ -19,9 +19,10 @@ from typing import Any, Literal
 import click
 import numpy as np
 import torch
-import torch.nn.functional as F
 import torch.utils.data
 from PIL import Image, UnidentifiedImageError
+import torchvision.transforms.functional as TF
+from torchvision.transforms import InterpolationMode
 
 from sharp.models import (
     PredictorParams,
@@ -1002,21 +1003,29 @@ def preprocess_one(
     image_np = np.ascontiguousarray(image_np)
     if not image_np.flags.writeable:
         image_np = image_np.copy()
-    image_pt = torch.from_numpy(image_np).to(dtype=dtype, device=device).permute(2, 0, 1)
+    image_pt = (
+        torch.from_numpy(image_np)
+        .permute(2, 0, 1)
+        .contiguous()
+        .to(device=device, dtype=dtype)
+    )
     image_pt = image_pt / 255.0
     _, height, width = image_pt.shape
     disparity_factor_pt = torch.tensor([f_px / width], dtype=dtype, device=device)
-    image_resized_pt = F.interpolate(
-        image_pt[None],
-        size=(target_h, target_w),
-        mode="bilinear",
-        align_corners=True,
-    )
-    # target_size_wh is (W, H); interpolate expects (H, W).
+    image_resized_pt = TF.resize(
+        image_pt,
+        [target_h, target_w],
+        interpolation=InterpolationMode.BILINEAR,
+        antialias=True,
+    ).unsqueeze(0)
+    # target_size_wh is (W, H); resize expects (H, W).
     # image_resized_pt: (B, C, H, W) with B=1 for now.
     if __debug__:
         assert image_resized_pt.ndim == 4
         assert image_resized_pt.shape[0] == 1
+        assert image_resized_pt.shape[1] == 3
+        assert image_resized_pt.shape[2] == target_h
+        assert image_resized_pt.shape[3] == target_w
         assert disparity_factor_pt.ndim >= 1
         assert disparity_factor_pt.shape[0] == 1
     aux = {
