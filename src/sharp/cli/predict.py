@@ -842,6 +842,7 @@ def predict_cli(
                         torch.device(device),
                         tile_size=tile_size,
                         tile_overlap=tile_overlap,
+                        tile_keep=tile_keep,
                         target_size_wh=(1536, 1536),
                         amp_enabled=amp,
                         amp_dtype=amp_dtype_to_use,
@@ -1319,6 +1320,7 @@ def predict_image_tiled(
     *,
     tile_size: int,
     tile_overlap: float,
+    tile_keep: float | None,
     target_size_wh: tuple[int, int],
     amp_enabled: bool,
     amp_dtype: torch.dtype | None,
@@ -1366,7 +1368,7 @@ def predict_image_tiled(
     u_global_inv = torch.linalg.inv(u_global)
 
     tile_preds_global: list[Gaussians3D] = []
-    for tile in tiles:
+    for tile_index, tile in enumerate(tiles, start=1):
         tile_img = image[tile.y0 : tile.y1, tile.x0 : tile.x1]
         preprocess_start = perf_counter() if metrics else None
         tile_resized_pt, tile_disp_factor, tile_aux = preprocess_one(
@@ -1398,6 +1400,65 @@ def predict_image_tiled(
             return_world=False,
             return_unprojection=False,
             device=device,
+        )
+
+        tile_width = tile.x1 - tile.x0
+        tile_height = tile.y1 - tile.y0
+        if tile_keep is not None:
+            keep_margin_px = int(round((1.0 - tile_keep) * tile_size / 2.0))
+        else:
+            keep_margin_px = int(tile_size * tile_overlap / 2.0)
+        keep_margin_px = max(0, keep_margin_px)
+        max_margin = max(0, min(tile_width, tile_height) // 2)
+        keep_margin_px = min(keep_margin_px, max_margin)
+        x_keep0 = keep_margin_px
+        y_keep0 = keep_margin_px
+        x_keep1 = tile_width - keep_margin_px
+        y_keep1 = tile_height - keep_margin_px
+        if x_keep1 <= x_keep0 or y_keep1 <= y_keep0:
+            x_keep0 = 0
+            y_keep0 = 0
+            x_keep1 = tile_width
+            y_keep1 = tile_height
+
+        mean_vectors = prediction.pred.mean_vectors
+        if mean_vectors.ndim == 3:
+            mean_xy = mean_vectors[0, :, :2]
+        elif mean_vectors.ndim == 2:
+            mean_xy = mean_vectors[:, :2]
+        else:
+            raise ValueError("Unsupported gaussians mean_vectors shape for tiling.")
+        gx = (mean_xy[:, 0] + 1.0) * 0.5 * tile_width
+        gy = (mean_xy[:, 1] + 1.0) * 0.5 * tile_height
+        keep_mask = (
+            (gx >= x_keep0)
+            & (gx < x_keep1)
+            & (gy >= y_keep0)
+            & (gy < y_keep1)
+        )
+        kept_count = int(keep_mask.sum().item())
+        total_count = int(keep_mask.numel())
+        LOGGER.debug("Tile %d: kept %d / %d gaussians", tile_index, kept_count, total_count)
+        if kept_count == 0:
+            LOGGER.warning("Tile %d produced no gaussians after edge suppression.", tile_index)
+            continue
+
+        def _index(tensor: torch.Tensor) -> torch.Tensor:
+            dim = 1 if tensor.ndim >= 3 else 0
+            indices = keep_mask.nonzero(as_tuple=False).flatten()
+            return tensor.index_select(dim, indices)
+
+        prediction = PredictionResult(
+            pred=Gaussians3D(
+                mean_vectors=_index(prediction.pred.mean_vectors),
+                singular_values=_index(prediction.pred.singular_values),
+                quaternions=_index(prediction.pred.quaternions),
+                colors=_index(prediction.pred.colors),
+                opacities=_index(prediction.pred.opacities),
+            ),
+            world=None,
+            unprojection_matrix=None,
+            unprojection_context=None,
         )
 
         k_tile = shift_intrinsics_for_tile(k_full, tile.x0, tile.y0)
