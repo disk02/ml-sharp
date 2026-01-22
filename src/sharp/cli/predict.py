@@ -463,6 +463,14 @@ def predict_cli(
         raise click.ClickException(
             "--tiling is not yet supported with batched inputs; use --batch-size=1."
         )
+    if tiling and fast_preview_compare:
+        raise click.ClickException(
+            "--tiling does not support compare; use non-tiled mode."
+        )
+    if tiling and save_ply:
+        raise click.ClickException(
+            "--tiling does not support PLY export; use non-tiled mode."
+        )
     if tiling and (sbs_image is None or not fast_preview_render):
         raise click.ClickException(
             "--tiling is only supported with --sbs-image and --fast-preview-render."
@@ -578,7 +586,9 @@ def predict_cli(
         raise click.ClickException(
             "--fast-preview-render is only supported for --sbs-image (not --render)."
         )
-    if save_ply is None and want_sbs_image:
+    if tiling:
+        effective_save_ply = False
+    elif save_ply is None and want_sbs_image:
         effective_save_ply = False
     elif save_ply is None and not want_sbs_image:
         effective_save_ply = True
@@ -817,7 +827,7 @@ def predict_cli(
                     effective_save_ply and not defer_export_world
                 )
                 if tiling:
-                    want_world_for_predict = True
+                    want_world_for_predict = False
                 if skip_world_conversion and (want_world_for_predict or effective_save_ply):
                     raise click.ClickException(
                         "World-space conversion is required for rendering or PLY export. "
