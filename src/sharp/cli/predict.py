@@ -1054,7 +1054,7 @@ def preprocess_one(
     width_for_disparity = width
     if reference_width is not None:
         if not isinstance(reference_width, int) or reference_width <= 0:
-            raise click.ClickException("--reference_width must be a positive integer.")
+            raise click.ClickException("reference_width must be a positive integer.")
         width_for_disparity = reference_width
     disparity_factor_pt = torch.tensor([f_px / width_for_disparity], dtype=dtype, device=device)
     image_resized_pt = TF.resize(
