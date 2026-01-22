@@ -35,6 +35,7 @@ from sharp.utils import logging as logging_utils
 from sharp.utils.gaussians import (
     Gaussians3D,
     SceneMetaData,
+    apply_transform,
     get_unprojection_matrix,
     save_ply,
     unproject_gaussians,
@@ -1323,7 +1324,7 @@ def predict_image_tiled(
     amp_dtype: torch.dtype | None,
     metrics: Metrics | None = None,
 ) -> PredictionResult:
-    """Predict Gaussians per tile and unproject each tile to world space."""
+    """Predict Gaussians per tile and remap into a shared pred-space."""
     height_full, width_full = image.shape[:2]
     fx = f_px
     fy = f_px
@@ -1349,7 +1350,22 @@ def predict_image_tiled(
     amp_dtype_to_use = amp_dtype if amp_enabled else None
     target_w, target_h = target_size_wh
 
-    tile_worlds: list[Gaussians3D] = []
+    k_full_resized = scale_intrinsics_for_resize(
+        k_full,
+        src_wh=(width_full, height_full),
+        dst_wh=target_size_wh,
+    )
+    intrinsics_full = torch.eye(4, device=device, dtype=k_full_resized.dtype)
+    intrinsics_full[:3, :3] = k_full_resized
+    extrinsics_full = torch.eye(4, device=device, dtype=k_full_resized.dtype)
+    u_global = get_unprojection_matrix(
+        extrinsics_full,
+        intrinsics_full,
+        (target_w, target_h),
+    )
+    u_global_inv = torch.linalg.inv(u_global)
+
+    tile_preds_global: list[Gaussians3D] = []
     for tile in tiles:
         tile_img = image[tile.y0 : tile.y1, tile.x0 : tile.x1]
         preprocess_start = perf_counter() if metrics else None
@@ -1393,20 +1409,20 @@ def predict_image_tiled(
         intrinsics_4 = torch.eye(4, device=device, dtype=k_tile_resized.dtype)
         intrinsics_4[:3, :3] = k_tile_resized
         extrinsics = torch.eye(4, device=device, dtype=k_tile_resized.dtype)
-        _ = get_unprojection_matrix(extrinsics, intrinsics_4, (target_w, target_h))
+        u_tile = get_unprojection_matrix(extrinsics, intrinsics_4, (target_w, target_h))
 
-        unproject_start = perf_counter() if metrics else None
-        world_gaussians_tile = unproject_gaussians(
+        # Remap tile pred-space gaussians into the global pred-space so fast preview renders once.
+        remap_start = perf_counter() if metrics else None
+        tile_to_global_pred = u_global_inv @ u_tile
+        global_pred_tile = apply_transform(
             prediction.pred,
-            extrinsics,
-            intrinsics_4,
-            (target_w, target_h),
+            tile_to_global_pred[:3],
             metrics=metrics,
         )
-        if metrics and unproject_start is not None:
-            metrics.add_time("tile_unproject", perf_counter() - unproject_start)
+        if metrics and remap_start is not None:
+            metrics.add_time("tile_remap", perf_counter() - remap_start)
 
-        tile_worlds.append(world_gaussians_tile)
+        tile_preds_global.append(global_pred_tile)
 
     def _concat_gaussians(items: list[Gaussians3D]) -> Gaussians3D:
         if not items:
@@ -1419,13 +1435,16 @@ def predict_image_tiled(
             opacities=torch.cat([g.opacities for g in items], dim=0),
         )
 
-    world_gaussians = _concat_gaussians(tile_worlds)
-    pred_gaussians = world_gaussians
-    unprojection_matrix = torch.eye(4, device=device, dtype=torch.float32)
+    pred_gaussians = _concat_gaussians(tile_preds_global)
+    if pred_gaussians.mean_vectors.numel() == 0:
+        raise ValueError("Tiled prediction produced no Gaussians.")
+    unprojection_matrix = u_global
+    if unprojection_matrix is None:
+        raise ValueError("Missing global unprojection matrix for tiled prediction.")
 
     return PredictionResult(
         pred=pred_gaussians,
-        world=world_gaussians,
+        world=None,
         unprojection_matrix=unprojection_matrix,
         unprojection_context=None,
     )
