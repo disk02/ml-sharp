@@ -1448,9 +1448,11 @@ def predict_image_tiled(
             continue
 
         def _index(tensor: torch.Tensor) -> torch.Tensor:
-            dim = 1 if tensor.ndim >= 3 else 0
-            indices = keep_mask.nonzero(as_tuple=False).flatten()
-            return tensor.index_select(dim, indices)
+            if tensor.ndim == 1:
+                return tensor[keep_mask]
+            if tensor.ndim == 2:
+                return tensor[:, keep_mask]
+            return tensor[:, keep_mask, ...]
 
         prediction = PredictionResult(
             pred=Gaussians3D(
