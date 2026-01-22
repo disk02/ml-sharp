@@ -1037,6 +1037,7 @@ def preprocess_one(
     *,
     target_size_wh: tuple[int, int],
     dtype: torch.dtype,
+    reference_width: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, dict]:
     target_w, target_h = target_size_wh
     image_np = np.ascontiguousarray(image_np)
@@ -1050,7 +1051,12 @@ def preprocess_one(
     )
     image_pt = image_pt / 255.0
     _, height, width = image_pt.shape
-    disparity_factor_pt = torch.tensor([f_px / width], dtype=dtype, device=device)
+    width_for_disparity = width
+    if reference_width is not None:
+        if not isinstance(reference_width, int) or reference_width <= 0:
+            raise click.ClickException("--reference_width must be a positive integer.")
+        width_for_disparity = reference_width
+    disparity_factor_pt = torch.tensor([f_px / width_for_disparity], dtype=dtype, device=device)
     image_resized_pt = TF.resize(
         image_pt,
         [target_h, target_w],
