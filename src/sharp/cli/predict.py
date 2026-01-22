@@ -29,6 +29,7 @@ from sharp.models import (
     RGBGaussianPredictor,
     create_predictor,
 )
+from sharp.utils.tiling import make_tiles, scale_intrinsics_for_resize, shift_intrinsics_for_tile
 from sharp.utils import io
 from sharp.utils import logging as logging_utils
 from sharp.utils.gaussians import (
@@ -457,6 +458,10 @@ def predict_cli(
         return
     if batch_size < 1:
         raise click.ClickException("--batch-size must be >= 1.")
+    if tiling and batch_size > 1:
+        raise click.ClickException(
+            "--tiling is not yet supported with batched inputs; use --batch-size=1."
+        )
     if tiling and (sbs_image is None or not fast_preview_render):
         raise click.ClickException(
             "--tiling is only supported with --sbs-image and --fast-preview-render."
@@ -810,6 +815,8 @@ def predict_cli(
                 want_world_for_predict = want_world_for_render or (
                     effective_save_ply and not defer_export_world
                 )
+                if tiling:
+                    want_world_for_predict = True
                 if skip_world_conversion and (want_world_for_predict or effective_save_ply):
                     raise click.ClickException(
                         "World-space conversion is required for rendering or PLY export. "
@@ -826,18 +833,32 @@ def predict_cli(
                 LOGGER.info("Computing world-space gaussians: %s", "yes" if space == "world" else "no")
 
                 predict_start = perf_counter()
-                prediction = predict_image(
-                    gaussian_predictor,
-                    image,
-                    f_px,
-                    torch.device(device),
-                    amp_enabled=amp,
-                    amp_dtype=amp_dtype_to_use,
-                    metrics=metrics,
-                    return_world=want_world_for_predict,
-                    return_unprojection=fast_preview_render,
-                    return_unprojection_context=fast_preview_render or effective_save_ply,
-                )
+                if tiling:
+                    prediction = predict_image_tiled(
+                        gaussian_predictor,
+                        image,
+                        f_px,
+                        torch.device(device),
+                        tile_size=tile_size,
+                        tile_overlap=tile_overlap,
+                        target_size_wh=(1536, 1536),
+                        amp_enabled=amp,
+                        amp_dtype=amp_dtype_to_use,
+                        metrics=metrics,
+                    )
+                else:
+                    prediction = predict_image(
+                        gaussian_predictor,
+                        image,
+                        f_px,
+                        torch.device(device),
+                        amp_enabled=amp,
+                        amp_dtype=amp_dtype_to_use,
+                        metrics=metrics,
+                        return_world=want_world_for_predict,
+                        return_unprojection=fast_preview_render,
+                        return_unprojection_context=fast_preview_render or effective_save_ply,
+                    )
                 metrics.add_time("predict_total", perf_counter() - predict_start)
                 _finalize_prediction(
                     prediction=prediction,
@@ -1286,6 +1307,127 @@ def predict_image(
         world=prediction.world,
         unprojection_matrix=prediction.unprojection_matrix,
         unprojection_context=prediction.unprojection_context,
+    )
+
+
+def predict_image_tiled(
+    predictor: RGBGaussianPredictor,
+    image: np.ndarray,
+    f_px: float,
+    device: torch.device,
+    *,
+    tile_size: int,
+    tile_overlap: float,
+    target_size_wh: tuple[int, int],
+    amp_enabled: bool,
+    amp_dtype: torch.dtype | None,
+    metrics: Metrics | None = None,
+) -> PredictionResult:
+    """Predict Gaussians per tile and unproject each tile to world space."""
+    height_full, width_full = image.shape[:2]
+    fx = f_px
+    fy = f_px
+    cx = (width_full - 1) / 2.0
+    cy = (height_full - 1) / 2.0
+    k_full = torch.tensor(
+        [
+            [fx, 0.0, cx],
+            [0.0, fy, cy],
+            [0.0, 0.0, 1.0],
+        ],
+        device=device,
+        dtype=torch.float32,
+    )
+    tiles = make_tiles(width_full, height_full, tile_size, tile_overlap)
+    LOGGER.info(
+        "Tiling enabled: tile_size=%d tile_overlap=%.2f tiles=%d",
+        tile_size,
+        tile_overlap,
+        len(tiles),
+    )
+
+    amp_dtype_to_use = amp_dtype if amp_enabled else None
+    target_w, target_h = target_size_wh
+
+    tile_worlds: list[Gaussians3D] = []
+    for tile in tiles:
+        tile_img = image[tile.y0 : tile.y1, tile.x0 : tile.x1]
+        preprocess_start = perf_counter() if metrics else None
+        tile_resized_pt, tile_disp_factor, tile_aux = preprocess_one(
+            tile_img,
+            f_px,
+            device,
+            target_size_wh=target_size_wh,
+            dtype=torch.float32,
+            reference_width=width_full,
+        )
+        tile_aux["metrics"] = metrics
+        if metrics and preprocess_start is not None:
+            metrics.add_time("tile_preprocess", perf_counter() - preprocess_start)
+
+        forward_start = perf_counter() if metrics else None
+        gaussians_ndc_batch = model_forward_batch(
+            predictor,
+            tile_resized_pt,
+            tile_disp_factor,
+            amp_dtype=amp_dtype_to_use,
+        )
+        if metrics and forward_start is not None:
+            metrics.add_time("tile_forward", perf_counter() - forward_start)
+
+        gaussians_ndc_one = _slice_gaussians(gaussians_ndc_batch, 0)
+        prediction = postprocess_one(
+            gaussians_ndc_one,
+            tile_aux,
+            return_world=False,
+            return_unprojection=False,
+            device=device,
+        )
+
+        k_tile = shift_intrinsics_for_tile(k_full, tile.x0, tile.y0)
+        k_tile_resized = scale_intrinsics_for_resize(
+            k_tile,
+            src_wh=(width_full, height_full),
+            dst_wh=target_size_wh,
+        )
+        intrinsics_4 = torch.eye(4, device=device, dtype=k_tile_resized.dtype)
+        intrinsics_4[:3, :3] = k_tile_resized
+        extrinsics = torch.eye(4, device=device, dtype=k_tile_resized.dtype)
+        _ = get_unprojection_matrix(extrinsics, intrinsics_4, (target_w, target_h))
+
+        unproject_start = perf_counter() if metrics else None
+        world_gaussians_tile = unproject_gaussians(
+            prediction.pred,
+            extrinsics,
+            intrinsics_4,
+            (target_w, target_h),
+            metrics=metrics,
+        )
+        if metrics and unproject_start is not None:
+            metrics.add_time("tile_unproject", perf_counter() - unproject_start)
+
+        tile_worlds.append(world_gaussians_tile)
+
+    def _concat_gaussians(items: list[Gaussians3D]) -> Gaussians3D:
+        if not items:
+            raise ValueError("No tiles produced for tiled prediction.")
+        return Gaussians3D(
+            mean_vectors=torch.cat([g.mean_vectors for g in items], dim=0),
+            singular_values=torch.cat([g.singular_values for g in items], dim=0),
+            quaternions=torch.cat([g.quaternions for g in items], dim=0),
+            colors=torch.cat([g.colors for g in items], dim=0),
+            opacities=torch.cat([g.opacities for g in items], dim=0),
+        )
+
+    world_gaussians = _concat_gaussians(tile_worlds)
+    pred_gaussians = world_gaussians
+    unprojection_matrix = torch.eye(4, device=device, dtype=torch.float32)
+
+    return PredictionResult(
+        pred=pred_gaussians,
+        world=world_gaussians,
+        unprojection_matrix=unprojection_matrix,
+        unprojection_context=None,
     )
 
 
