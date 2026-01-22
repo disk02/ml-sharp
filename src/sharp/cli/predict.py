@@ -1482,12 +1482,15 @@ def predict_image_tiled(
     def _concat_gaussians(items: list[Gaussians3D]) -> Gaussians3D:
         if not items:
             raise ValueError("No tiles produced for tiled prediction.")
+        # Gaussians are batch-first (B, N, ...); keep B=1 and concat along splat dim.
+        if not all(g.mean_vectors.shape[0] == 1 for g in items):
+            raise ValueError("Tiled gaussians must have batch dimension of 1.")
         return Gaussians3D(
-            mean_vectors=torch.cat([g.mean_vectors for g in items], dim=0),
-            singular_values=torch.cat([g.singular_values for g in items], dim=0),
-            quaternions=torch.cat([g.quaternions for g in items], dim=0),
-            colors=torch.cat([g.colors for g in items], dim=0),
-            opacities=torch.cat([g.opacities for g in items], dim=0),
+            mean_vectors=torch.cat([g.mean_vectors for g in items], dim=1),
+            singular_values=torch.cat([g.singular_values for g in items], dim=1),
+            quaternions=torch.cat([g.quaternions for g in items], dim=1),
+            colors=torch.cat([g.colors for g in items], dim=1),
+            opacities=torch.cat([g.opacities for g in items], dim=1),
         )
 
     pred_gaussians = _concat_gaussians(tile_preds_global)
