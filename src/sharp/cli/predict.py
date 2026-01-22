@@ -1402,24 +1402,18 @@ def predict_image_tiled(
             device=device,
         )
 
-        tile_width = tile.x1 - tile.x0
-        tile_height = tile.y1 - tile.y0
+        # Gaussians are in pred-space for the inference canvas; keep mask uses target pixels.
+        min_target = min(target_w, target_h)
         if tile_keep is not None:
-            keep_margin_px = int(round((1.0 - tile_keep) * tile_size / 2.0))
+            keep_margin_px = int(round((1.0 - tile_keep) * min_target / 2.0))
         else:
-            keep_margin_px = int(tile_size * tile_overlap / 2.0)
-        keep_margin_px = max(0, keep_margin_px)
-        max_margin = max(0, min(tile_width, tile_height) // 2)
-        keep_margin_px = min(keep_margin_px, max_margin)
+            keep_margin_px = int(round(min_target * tile_overlap / 2.0))
+        max_margin = max(0, min_target // 2 - 1)
+        keep_margin_px = max(0, min(keep_margin_px, max_margin))
         x_keep0 = keep_margin_px
         y_keep0 = keep_margin_px
-        x_keep1 = tile_width - keep_margin_px
-        y_keep1 = tile_height - keep_margin_px
-        if x_keep1 <= x_keep0 or y_keep1 <= y_keep0:
-            x_keep0 = 0
-            y_keep0 = 0
-            x_keep1 = tile_width
-            y_keep1 = tile_height
+        x_keep1 = target_w - keep_margin_px
+        y_keep1 = target_h - keep_margin_px
 
         mean_vectors = prediction.pred.mean_vectors
         if mean_vectors.ndim == 3:
@@ -1428,8 +1422,8 @@ def predict_image_tiled(
             mean_xy = mean_vectors[:, :2]
         else:
             raise ValueError("Unsupported gaussians mean_vectors shape for tiling.")
-        gx = (mean_xy[:, 0] + 1.0) * 0.5 * tile_width
-        gy = (mean_xy[:, 1] + 1.0) * 0.5 * tile_height
+        gx = (mean_xy[:, 0] + 1.0) * 0.5 * target_w
+        gy = (mean_xy[:, 1] + 1.0) * 0.5 * target_h
         keep_mask = (
             (gx >= x_keep0)
             & (gx < x_keep1)
