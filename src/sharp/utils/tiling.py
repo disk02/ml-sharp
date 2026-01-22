@@ -41,7 +41,7 @@ def make_tiles(W: int, H: int, tile_size: int, overlap: float) -> list[Tile]:
     if overlap < 0.0 or overlap >= 0.5:
         raise ValueError("overlap must be in [0.0, 0.5).")
 
-    if tile_size >= W or tile_size >= H:
+    if tile_size >= W and tile_size >= H:
         return [Tile(0, 0, W, H)]
 
     stride = max(1, int(round(tile_size * (1.0 - overlap))))
