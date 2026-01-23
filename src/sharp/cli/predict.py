@@ -1413,17 +1413,24 @@ def predict_image_tiled(
         )
 
         # Gaussians are in pred-space for the inference canvas; keep mask uses target pixels.
-        min_target = min(target_w, target_h)
         if tile_keep is not None:
-            keep_margin_px = int(round((1.0 - tile_keep) * min_target / 2.0))
+            base_x_margin = int(round((1.0 - tile_keep) * target_w / 2.0))
+            base_y_margin = int(round((1.0 - tile_keep) * target_h / 2.0))
         else:
-            keep_margin_px = int(round(min_target * tile_overlap / 2.0))
-        max_margin = max(0, min_target // 2 - 1)
-        keep_margin_px = max(0, min(keep_margin_px, max_margin))
-        x_keep0 = keep_margin_px
-        y_keep0 = keep_margin_px
-        x_keep1 = target_w - keep_margin_px
-        y_keep1 = target_h - keep_margin_px
+            base_x_margin = int(round(tile_overlap * target_w / 2.0))
+            base_y_margin = int(round(tile_overlap * target_h / 2.0))
+        base_x_margin = max(0, min(base_x_margin, target_w // 2 - 1))
+        base_y_margin = max(0, min(base_y_margin, target_h // 2 - 1))
+
+        left_margin = base_x_margin if tile.x0 > 0 else 0
+        right_margin = base_x_margin if tile.x1 < width_full else 0
+        top_margin = base_y_margin if tile.y0 > 0 else 0
+        bottom_margin = base_y_margin if tile.y1 < height_full else 0
+
+        x_keep0 = left_margin
+        y_keep0 = top_margin
+        x_keep1 = target_w - right_margin
+        y_keep1 = target_h - bottom_margin
 
         mean_vectors = prediction.pred.mean_vectors
         if mean_vectors.ndim == 3:
@@ -1434,6 +1441,36 @@ def predict_image_tiled(
             raise ValueError("Unsupported gaussians mean_vectors shape for tiling.")
         gx = (mean_xy[:, 0] + 1.0) * 0.5 * target_w
         gy = (mean_xy[:, 1] + 1.0) * 0.5 * target_h
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            mean_x_min = mean_xy[:, 0].min().item()
+            mean_x_max = mean_xy[:, 0].max().item()
+            mean_y_min = mean_xy[:, 1].min().item()
+            mean_y_max = mean_xy[:, 1].max().item()
+            gx_min = gx.min().item()
+            gx_max = gx.max().item()
+            gy_min = gy.min().item()
+            gy_max = gy.max().item()
+            LOGGER.debug(
+                "tile=%d x0=%d y0=%d x1=%d y1=%d mean_x=[%.3f,%.3f] mean_y=[%.3f,%.3f] "
+                "gx=[%.1f,%.1f] gy=[%.1f,%.1f] keep=[%d:%d,%d:%d]",
+                tile_index,
+                tile.x0,
+                tile.y0,
+                tile.x1,
+                tile.y1,
+                mean_x_min,
+                mean_x_max,
+                mean_y_min,
+                mean_y_max,
+                gx_min,
+                gx_max,
+                gy_min,
+                gy_max,
+                x_keep0,
+                x_keep1,
+                y_keep0,
+                y_keep1,
+            )
         keep_mask = (
             (gx >= x_keep0)
             & (gx < x_keep1)
