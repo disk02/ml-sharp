@@ -1461,42 +1461,32 @@ def predict_image_tiled(
         else:
             raise ValueError("Unsupported gaussians mean_vectors shape for tiling.")
 
-        def _project_to_pixels(
-            mean_vectors: torch.Tensor, intrinsics: torch.Tensor
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            if mean_vectors.ndim == 2:
-                mean_vectors = mean_vectors.unsqueeze(0)
-                squeeze = True
-            elif mean_vectors.ndim == 3:
-                squeeze = False
-            else:
-                raise ValueError("Unsupported gaussians mean_vectors shape for projection.")
-            x = mean_vectors[..., 0]
-            y = mean_vectors[..., 1]
-            z = mean_vectors[..., 2].clamp_min(1e-6)
-            fx = intrinsics[0, 0]
-            fy = intrinsics[1, 1]
-            cx = intrinsics[0, 2]
-            cy = intrinsics[1, 2]
-            u = fx * (x / z) + cx
-            v = fy * (y / z) + cy
-            if squeeze:
-                return u[0], v[0]
-            return u, v
+        intrinsics_4 = torch.eye(4, device=device, dtype=k_tile_resized.dtype)
+        intrinsics_4[:3, :3] = k_tile_resized
+        extrinsics = torch.eye(4, device=device, dtype=k_tile_resized.dtype)
+        u_tile = get_unprojection_matrix(extrinsics, intrinsics_4, (target_w, target_h))
+        u_tile_inv = torch.linalg.inv(u_tile)
 
-        gx, gy = _project_to_pixels(prediction.pred.mean_vectors, k_tile_resized)
-        if gx.ndim > 1:
-            gx = gx[0]
-            gy = gy[0]
+        if mean_vectors.ndim == 3:
+            pred_points = mean_vectors[0]
+        else:
+            pred_points = mean_vectors
+        ones = torch.ones(
+            (pred_points.shape[0], 1), device=pred_points.device, dtype=pred_points.dtype
+        )
+        pred_points_h = torch.cat([pred_points, ones], dim=-1)
+        px_h = (u_tile_inv @ pred_points_h.T).T
+        u = px_h[:, 0] / px_h[:, 3]
+        v = px_h[:, 1] / px_h[:, 3]
         if LOGGER.isEnabledFor(logging.DEBUG):
             mean_x_min = mean_xy[:, 0].min().item()
             mean_x_max = mean_xy[:, 0].max().item()
             mean_y_min = mean_xy[:, 1].min().item()
             mean_y_max = mean_xy[:, 1].max().item()
-            u_min = gx.min().item()
-            u_max = gx.max().item()
-            v_min = gy.min().item()
-            v_max = gy.max().item()
+            u_min = u.min().item()
+            u_max = u.max().item()
+            v_min = v.min().item()
+            v_max = v.max().item()
             LOGGER.debug(
                 "tile=%d x0=%d y0=%d x1=%d y1=%d mean_x=[%.3f,%.3f] mean_y=[%.3f,%.3f] "
                 "u=[%.1f,%.1f] v=[%.1f,%.1f] keep=[%d:%d,%d:%d]",
@@ -1519,10 +1509,10 @@ def predict_image_tiled(
                 y_keep1,
             )
         keep_mask = (
-            (gx >= x_keep0)
-            & (gx < x_keep1)
-            & (gy >= y_keep0)
-            & (gy < y_keep1)
+            (u >= x_keep0)
+            & (u < x_keep1)
+            & (v >= y_keep0)
+            & (v < y_keep1)
         )
         kept_count = int(keep_mask.sum().item())
         total_count = int(keep_mask.numel())
@@ -1550,11 +1540,6 @@ def predict_image_tiled(
             unprojection_matrix=None,
             unprojection_context=None,
         )
-
-        intrinsics_4 = torch.eye(4, device=device, dtype=k_tile_resized.dtype)
-        intrinsics_4[:3, :3] = k_tile_resized
-        extrinsics = torch.eye(4, device=device, dtype=k_tile_resized.dtype)
-        u_tile = get_unprojection_matrix(extrinsics, intrinsics_4, (target_w, target_h))
 
         # Remap tile pred-space gaussians into the global pred-space so fast preview renders once.
         remap_start = perf_counter() if metrics else None
