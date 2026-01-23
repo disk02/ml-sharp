@@ -1412,6 +1412,27 @@ def predict_image_tiled(
             device=device,
         )
 
+        tile_w = tile.x1 - tile.x0
+        tile_h = tile.y1 - tile.y0
+        k_tile = shift_intrinsics_for_tile(k_full, tile.x0, tile.y0)
+        k_tile_resized = scale_intrinsics_for_resize(
+            k_tile,
+            src_wh=(tile_w, tile_h),
+            dst_wh=target_size_wh,
+        )
+        LOGGER.debug(
+            "tile=%d x0=%d y0=%d w=%d h=%d cx=%.2f cx_resized=%.2f cy=%.2f cy_resized=%.2f",
+            tile_index,
+            tile.x0,
+            tile.y0,
+            tile_w,
+            tile_h,
+            k_tile[0, 2].item(),
+            k_tile_resized[0, 2].item(),
+            k_tile[1, 2].item(),
+            k_tile_resized[1, 2].item(),
+        )
+
         # Gaussians are in pred-space for the inference canvas; keep mask uses target pixels.
         if tile_keep is not None:
             base_x_margin = int(round((1.0 - tile_keep) * target_w / 2.0))
@@ -1439,20 +1460,46 @@ def predict_image_tiled(
             mean_xy = mean_vectors[:, :2]
         else:
             raise ValueError("Unsupported gaussians mean_vectors shape for tiling.")
-        gx = (mean_xy[:, 0] + 1.0) * 0.5 * target_w
-        gy = (mean_xy[:, 1] + 1.0) * 0.5 * target_h
+
+        def _project_to_pixels(
+            mean_vectors: torch.Tensor, intrinsics: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            if mean_vectors.ndim == 2:
+                mean_vectors = mean_vectors.unsqueeze(0)
+                squeeze = True
+            elif mean_vectors.ndim == 3:
+                squeeze = False
+            else:
+                raise ValueError("Unsupported gaussians mean_vectors shape for projection.")
+            x = mean_vectors[..., 0]
+            y = mean_vectors[..., 1]
+            z = mean_vectors[..., 2].clamp_min(1e-6)
+            fx = intrinsics[0, 0]
+            fy = intrinsics[1, 1]
+            cx = intrinsics[0, 2]
+            cy = intrinsics[1, 2]
+            u = fx * (x / z) + cx
+            v = fy * (y / z) + cy
+            if squeeze:
+                return u[0], v[0]
+            return u, v
+
+        gx, gy = _project_to_pixels(prediction.pred.mean_vectors, k_tile_resized)
+        if gx.ndim > 1:
+            gx = gx[0]
+            gy = gy[0]
         if LOGGER.isEnabledFor(logging.DEBUG):
             mean_x_min = mean_xy[:, 0].min().item()
             mean_x_max = mean_xy[:, 0].max().item()
             mean_y_min = mean_xy[:, 1].min().item()
             mean_y_max = mean_xy[:, 1].max().item()
-            gx_min = gx.min().item()
-            gx_max = gx.max().item()
-            gy_min = gy.min().item()
-            gy_max = gy.max().item()
+            u_min = gx.min().item()
+            u_max = gx.max().item()
+            v_min = gy.min().item()
+            v_max = gy.max().item()
             LOGGER.debug(
                 "tile=%d x0=%d y0=%d x1=%d y1=%d mean_x=[%.3f,%.3f] mean_y=[%.3f,%.3f] "
-                "gx=[%.1f,%.1f] gy=[%.1f,%.1f] keep=[%d:%d,%d:%d]",
+                "u=[%.1f,%.1f] v=[%.1f,%.1f] keep=[%d:%d,%d:%d]",
                 tile_index,
                 tile.x0,
                 tile.y0,
@@ -1462,10 +1509,10 @@ def predict_image_tiled(
                 mean_x_max,
                 mean_y_min,
                 mean_y_max,
-                gx_min,
-                gx_max,
-                gy_min,
-                gy_max,
+                u_min,
+                u_max,
+                v_min,
+                v_max,
                 x_keep0,
                 x_keep1,
                 y_keep0,
@@ -1504,26 +1551,6 @@ def predict_image_tiled(
             unprojection_context=None,
         )
 
-        tile_w = tile.x1 - tile.x0
-        tile_h = tile.y1 - tile.y0
-        k_tile = shift_intrinsics_for_tile(k_full, tile.x0, tile.y0)
-        k_tile_resized = scale_intrinsics_for_resize(
-            k_tile,
-            src_wh=(tile_w, tile_h),
-            dst_wh=target_size_wh,
-        )
-        LOGGER.debug(
-            "tile=%d x0=%d y0=%d w=%d h=%d cx=%.2f cx_resized=%.2f cy=%.2f cy_resized=%.2f",
-            tile_index,
-            tile.x0,
-            tile.y0,
-            tile_w,
-            tile_h,
-            k_tile[0, 2].item(),
-            k_tile_resized[0, 2].item(),
-            k_tile[1, 2].item(),
-            k_tile_resized[1, 2].item(),
-        )
         intrinsics_4 = torch.eye(4, device=device, dtype=k_tile_resized.dtype)
         intrinsics_4[:3, :3] = k_tile_resized
         extrinsics = torch.eye(4, device=device, dtype=k_tile_resized.dtype)
