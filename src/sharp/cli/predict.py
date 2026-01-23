@@ -1467,11 +1467,25 @@ def predict_image_tiled(
             unprojection_context=None,
         )
 
+        tile_w = tile.x1 - tile.x0
+        tile_h = tile.y1 - tile.y0
         k_tile = shift_intrinsics_for_tile(k_full, tile.x0, tile.y0)
         k_tile_resized = scale_intrinsics_for_resize(
             k_tile,
-            src_wh=(width_full, height_full),
+            src_wh=(tile_w, tile_h),
             dst_wh=target_size_wh,
+        )
+        LOGGER.debug(
+            "tile=%d x0=%d y0=%d w=%d h=%d cx=%.2f cx_resized=%.2f cy=%.2f cy_resized=%.2f",
+            tile_index,
+            tile.x0,
+            tile.y0,
+            tile_w,
+            tile_h,
+            k_tile[0, 2].item(),
+            k_tile_resized[0, 2].item(),
+            k_tile[1, 2].item(),
+            k_tile_resized[1, 2].item(),
         )
         intrinsics_4 = torch.eye(4, device=device, dtype=k_tile_resized.dtype)
         intrinsics_4[:3, :3] = k_tile_resized
