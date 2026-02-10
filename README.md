@@ -39,6 +39,12 @@ To run prediction:
 sharp predict -i /path/to/input/images -o /path/to/output/gaussians
 ```
 
+To override the focal length used for intrinsics/projection:
+
+```
+sharp predict -i /path/to/input/images -o /path/to/output/gaussians --focal-length 24
+```
+
 The model checkpoint will be downloaded automatically on first run and cached locally at `~/.cache/torch/hub/checkpoints/`.
 
 Alternatively, you can download the model directly:

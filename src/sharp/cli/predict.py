@@ -190,6 +190,16 @@ def _align_for_compare(
     return baseline_crop, fast_crop
 
 
+def resolve_focal_length_mm(
+    cli_focal_length: float | None, exif_focal_length: float | None, default: float = 30.0
+) -> float:
+    if cli_focal_length is not None:
+        return float(cli_focal_length)
+    if exif_focal_length is not None:
+        return float(exif_focal_length)
+    return float(default)
+
+
 @click.command()
 @click.option(
     "-i",
@@ -212,6 +222,12 @@ def _align_for_compare(
     default=None,
     help="Path to the .pt checkpoint. If not provided, downloads the default model automatically.",
     required=False,
+)
+@click.option(
+    "--focal-length",
+    type=float,
+    default=None,
+    help="Override focal length in millimeters. If set, ignores EXIF focal length and default.",
 )
 @click.option(
     "--render/--no-render",
@@ -381,6 +397,7 @@ def predict_cli(
     input_path: Path,
     output_path: Path,
     checkpoint_path: Path,
+    focal_length: float | None,
     with_rendering: bool,
     sbs_image: Path | None,
     sbs_format: str | None,
@@ -426,6 +443,11 @@ def predict_cli(
         return
     if batch_size < 1:
         raise click.ClickException("--batch-size must be >= 1.")
+    if focal_length is not None and not 5.0 <= focal_length <= 300.0:
+        raise click.BadParameter(
+            "must be between 5 and 300 mm.",
+            param_hint="--focal-length",
+        )
 
     def _natural_sort_key(path: Path) -> list[tuple[int, object]]:
         relative_path = path.relative_to(input_path).as_posix()
@@ -744,16 +766,34 @@ def predict_cli(
                 LOGGER.info("Processing %s (%d/%d)", image_path, index, len(image_paths))
                 io_start = perf_counter()
                 try:
-                    image, _, f_px = io.load_rgb(image_path)
+                    image, _, exif_focal_length_mm = io.load_rgb(image_path)
                 except (OSError, UnidentifiedImageError, ValueError) as exc:
                     LOGGER.warning("Skipping unreadable image %s: %s", image_path, exc)
                     continue
                 metrics.add_time("io_decode", perf_counter() - io_start)
                 height, width = image.shape[:2]
+                model_focal_length_mm = resolve_focal_length_mm(
+                    None, exif_focal_length_mm, default=30.0
+                )
+                resolved_focal_length_mm = resolve_focal_length_mm(
+                    focal_length, exif_focal_length_mm, default=30.0
+                )
+                focal_length_source = (
+                    "CLI override"
+                    if focal_length is not None
+                    else ("EXIF" if exif_focal_length_mm is not None else "default")
+                )
+                LOGGER.info(
+                    "Using focal length: %.2fmm (%s)",
+                    resolved_focal_length_mm,
+                    focal_length_source,
+                )
+                f_px_model = io.convert_focallength(width, height, model_focal_length_mm)
+                f_px_render = io.convert_focallength(width, height, resolved_focal_length_mm)
                 intrinsics = torch.tensor(
                     [
-                        [f_px, 0, (width - 1) / 2.0, 0],
-                        [0, f_px, (height - 1) / 2.0, 0],
+                        [f_px_render, 0, (width - 1) / 2.0, 0],
+                        [0, f_px_render, (height - 1) / 2.0, 0],
                         [0, 0, 1, 0],
                         [0, 0, 0, 1],
                     ],
@@ -790,8 +830,9 @@ def predict_cli(
                 prediction = predict_image(
                     gaussian_predictor,
                     image,
-                    f_px,
+                    f_px_model,
                     torch.device(device),
+                    f_px_render=f_px_render,
                     amp_enabled=amp,
                     amp_dtype=amp_dtype_to_use,
                     metrics=metrics,
@@ -806,7 +847,7 @@ def predict_cli(
                     rel_path=rel_path,
                     out_dir=out_dir,
                     image=image,
-                    f_px=f_px,
+                    f_px=f_px_render,
                     height=height,
                     width=width,
                     intrinsics=intrinsics,
@@ -829,16 +870,34 @@ def predict_cli(
                     LOGGER.info("Processing %s (%d/%d)", image_path, index, total_images)
                     io_start = perf_counter()
                     try:
-                        image, _, f_px = io.load_rgb(image_path)
+                        image, _, exif_focal_length_mm = io.load_rgb(image_path)
                     except (OSError, UnidentifiedImageError, ValueError) as exc:
                         LOGGER.warning("Skipping unreadable image %s: %s", image_path, exc)
                         continue
                     metrics.add_time("io_decode", perf_counter() - io_start)
                     height, width = image.shape[:2]
+                    model_focal_length_mm = resolve_focal_length_mm(
+                        None, exif_focal_length_mm, default=30.0
+                    )
+                    resolved_focal_length_mm = resolve_focal_length_mm(
+                        focal_length, exif_focal_length_mm, default=30.0
+                    )
+                    focal_length_source = (
+                        "CLI override"
+                        if focal_length is not None
+                        else ("EXIF" if exif_focal_length_mm is not None else "default")
+                    )
+                    LOGGER.info(
+                        "Using focal length: %.2fmm (%s)",
+                        resolved_focal_length_mm,
+                        focal_length_source,
+                    )
+                    f_px_model = io.convert_focallength(width, height, model_focal_length_mm)
+                    f_px_render = io.convert_focallength(width, height, resolved_focal_length_mm)
                     intrinsics = torch.tensor(
                         [
-                            [f_px, 0, (width - 1) / 2.0, 0],
-                            [0, f_px, (height - 1) / 2.0, 0],
+                            [f_px_render, 0, (width - 1) / 2.0, 0],
+                            [0, f_px_render, (height - 1) / 2.0, 0],
                             [0, 0, 1, 0],
                             [0, 0, 0, 1],
                         ],
@@ -878,11 +937,12 @@ def predict_cli(
                     preprocess_start = perf_counter() if metrics else None
                     image_resized_pt, disparity_factor, aux = preprocess_one(
                         image,
-                        f_px,
+                        f_px_model,
                         torch.device(device),
                         target_size_wh=(1536, 1536),
                         dtype=torch.float32,
                     )
+                    aux["f_px"] = f_px_render
                     aux["metrics"] = metrics
                     preprocess_elapsed = 0.0
                     if metrics and preprocess_start is not None:
@@ -894,7 +954,7 @@ def predict_cli(
                             "rel_path": rel_path,
                             "out_dir": out_dir,
                             "image": image,
-                            "f_px": f_px,
+                            "f_px": f_px_render,
                             "height": height,
                             "width": width,
                             "intrinsics": intrinsics,
@@ -1187,6 +1247,8 @@ def predict_image(
     image: np.ndarray,
     f_px: float,
     device: torch.device,
+    *,
+    f_px_render: float | None = None,
     amp_enabled: bool,
     amp_dtype: torch.dtype,
     metrics: Metrics | None = None,
@@ -1206,6 +1268,8 @@ def predict_image(
         target_size_wh=target_size_wh,
         dtype=torch.float32,
     )
+    if f_px_render is not None:
+        aux["f_px"] = f_px_render
     aux["metrics"] = metrics
     if metrics and preprocess_start is not None:
         metrics.add_time("preprocess", perf_counter() - preprocess_start)
