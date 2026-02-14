@@ -29,7 +29,7 @@ Image.MAX_IMAGE_PIXELS = 200000000
 
 def load_rgb(
     path: Path, auto_rotate: bool = True, remove_alpha: bool = True
-) -> tuple[np.ndarray, list[bytes] | None, float]:
+) -> tuple[np.ndarray, list[bytes] | None, float | None]:
     """Load an RGB image."""
     LOGGER.debug(f"Loading image {path} ...")
 
@@ -54,17 +54,7 @@ def load_rgb(
         elif exif_orientation != 1:
             LOGGER.warning(f"Ignoring image orientation {exif_orientation}.")
 
-    # Extract the focal length.
-    f_35mm = img_exif.get("FocalLengthIn35mmFilm", img_exif.get("FocalLenIn35mmFilm", None))
-    if f_35mm is None or f_35mm < 1:
-        f_35mm = img_exif.get("FocalLength", None)
-        if f_35mm is None:
-            LOGGER.warn(f"Did not find focallength in exif data of {path} - Setting to 30mm.")
-            f_35mm = 30.0
-        if f_35mm < 10.0:
-            LOGGER.info("Found focal length below 10mm, assuming it's not for 35mm.")
-            # This is a very crude approximation.
-            f_35mm *= 8.4
+    exif_focal_length_mm = _extract_exif_focal_length_mm(img_exif)
 
     img = np.asarray(img_pil)
     # Convert to RGB if single channel.
@@ -75,11 +65,23 @@ def load_rgb(
         img = img[:, :, :3]
 
     LOGGER.debug(f"\tHxW: {img.shape[0]}x{img.shape[1]}")
-    LOGGER.debug(f"\tfocal length @ 35mm film: {f_35mm}mm")
-    f_px = convert_focallength(img.shape[1], img.shape[0], f_35mm)
-    LOGGER.debug(f"\tfocal length: {f_px:.2f}px")
+    if exif_focal_length_mm is not None:
+        LOGGER.debug(f"\tfocal length @ 35mm film: {exif_focal_length_mm}mm")
 
-    return img, icc_profile, f_px
+    return img, icc_profile, exif_focal_length_mm
+
+
+def _extract_exif_focal_length_mm(img_exif: dict[str, Any]) -> float | None:
+    f_35mm = img_exif.get("FocalLengthIn35mmFilm", img_exif.get("FocalLenIn35mmFilm", None))
+    if f_35mm is None or f_35mm < 1:
+        f_35mm = img_exif.get("FocalLength", None)
+    if f_35mm is None:
+        return None
+    if f_35mm < 10.0:
+        LOGGER.info("Found focal length below 10mm, assuming it's not for 35mm.")
+        # This is a very crude approximation.
+        f_35mm *= 8.4
+    return float(f_35mm)
 
 
 def extract_exif(img_pil: Image.Image) -> dict[str, Any]:
