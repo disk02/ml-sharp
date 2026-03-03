@@ -286,6 +286,13 @@ def resolve_focal_length_mm(
     ),
 )
 @click.option(
+    "--sbs-convergence-depth",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help="Convergence distance (world units) used for off-axis stereo when rendering SBS. 0 = auto.",
+)
+@click.option(
     "--fast-preview-render",
     is_flag=True,
     default=False,
@@ -405,6 +412,7 @@ def predict_cli(
     png_format: bool,
     sbs_image_frame: int,
     stereo_strength: float,
+    sbs_convergence_depth: float,
     fast_preview_render: bool,
     sbs_min_opacity: float,
     sbs_min_scale: float,
@@ -655,6 +663,7 @@ def predict_cli(
                         metrics=metrics,
                         sbs_async_writer=None,
                         stereo_baseline=stereo_strength,
+                        sbs_convergence_depth=sbs_convergence_depth,
                         min_opacity=sbs_prune_min_opacity,
                         min_scale=sbs_prune_min_scale,
                         max_splats=sbs_prune_max_splats,
@@ -673,6 +682,7 @@ def predict_cli(
                     metrics=metrics,
                     sbs_async_writer=None if fast_preview_compare else sbs_async_writer,
                     stereo_baseline=stereo_strength,
+                    sbs_convergence_depth=sbs_convergence_depth,
                     min_opacity=sbs_prune_min_opacity,
                     min_scale=sbs_prune_min_scale,
                     max_splats=sbs_prune_max_splats,
@@ -712,6 +722,7 @@ def predict_cli(
                     metrics=metrics,
                     sbs_async_writer=sbs_async_writer,
                     stereo_baseline=stereo_strength if sbs_image_path is not None else 0.065,
+                    sbs_convergence_depth=sbs_convergence_depth,
                     min_opacity=sbs_prune_min_opacity,
                     min_scale=sbs_prune_min_scale,
                     max_splats=sbs_prune_max_splats,

@@ -289,6 +289,97 @@ def create_camera_matrix(
     return matrix
 
 
+def compute_parallel_stereo_pair(
+    camera_model: PinholeCameraModel,
+    eye_mid: torch.Tensor,
+    baseline: float,
+    convergence_depth: float | None = None,
+) -> tuple[CameraInfo, CameraInfo]:
+    """Compute a parallel stereo pair with off-axis convergence via principal point shift."""
+    device = eye_mid.device
+    dtype = eye_mid.dtype
+
+    base_intrinsics = camera_model.screen_intrinsics.to(device=device, dtype=dtype).clone()
+    screen_extrinsics = camera_model.screen_extrinsics.to(device=device, dtype=dtype)
+
+    origin = (
+        eye_mid
+        if camera_model.lookat_mode == "ahead"
+        else torch.zeros(3, device=device, dtype=dtype)
+    )
+
+    if camera_model.lookat_point is None:
+        depth_focus = max(camera_model.min_depth_focus, camera_model.depth_quantiles.focus)
+        look_at_position = origin + torch.tensor([0.0, 0.0, depth_focus], device=device, dtype=dtype)
+    else:
+        look_at_position = origin + torch.tensor(
+            [*camera_model.lookat_point], device=device, dtype=dtype
+        )
+
+    world_up = torch.tensor([0.0, -1.0, 0.0], device=device, dtype=dtype)
+
+    camera_front = look_at_position - eye_mid
+    front_norm = camera_front.norm()
+    if front_norm < 1e-6:
+        camera_front = torch.tensor([0.0, 0.0, 1.0], device=device, dtype=dtype)
+    else:
+        camera_front = camera_front / front_norm
+
+    camera_right = torch.cross(camera_front, world_up, dim=-1)
+    right_norm = camera_right.norm()
+    if right_norm < 1e-6:
+        camera_right = torch.tensor([1.0, 0.0, 0.0], device=device, dtype=dtype)
+    else:
+        camera_right = camera_right / right_norm
+
+    camera_down = torch.cross(camera_front, camera_right, dim=-1)
+    camera_down = camera_down / camera_down.norm()
+    camera_front = torch.cross(camera_right, camera_down, dim=-1)
+    camera_front = camera_front / camera_front.norm()
+    rotation_matrix = torch.stack([camera_right, camera_down, camera_front], dim=-1)
+
+    half_baseline = float(baseline) * 0.5
+    eye_position_l = eye_mid - camera_right * half_baseline
+    eye_position_r = eye_mid + camera_right * half_baseline
+
+    rotation_wc = rotation_matrix.transpose(-1, -2)
+    extrinsics_l = torch.eye(4, device=device, dtype=dtype)
+    extrinsics_r = torch.eye(4, device=device, dtype=dtype)
+    extrinsics_l[:3, :3] = rotation_wc
+    extrinsics_r[:3, :3] = rotation_wc
+    extrinsics_l[:3, 3] = -(rotation_wc @ eye_position_l)
+    extrinsics_r[:3, 3] = -(rotation_wc @ eye_position_r)
+    extrinsics_l = extrinsics_l @ screen_extrinsics
+    extrinsics_r = extrinsics_r @ screen_extrinsics
+
+    focus_depth = max(camera_model.min_depth_focus, camera_model.depth_quantiles.focus)
+    convergence_z = convergence_depth if convergence_depth is not None else focus_depth
+    if convergence_z <= 0:
+        convergence_z = focus_depth
+
+    fx = float(base_intrinsics[0, 0])
+    cx_shift = fx * half_baseline / convergence_z if convergence_z > 0 else 0.0
+    intrinsics_l = base_intrinsics.clone()
+    intrinsics_r = base_intrinsics.clone()
+    intrinsics_l[0, 2] = intrinsics_l[0, 2] + cx_shift
+    intrinsics_r[0, 2] = intrinsics_r[0, 2] - cx_shift
+
+    return (
+        CameraInfo(
+            intrinsics=intrinsics_l,
+            extrinsics=extrinsics_l,
+            width=camera_model.screen_resolution_px[0],
+            height=camera_model.screen_resolution_px[1],
+        ),
+        CameraInfo(
+            intrinsics=intrinsics_r,
+            extrinsics=extrinsics_r,
+            width=camera_model.screen_resolution_px[0],
+            height=camera_model.screen_resolution_px[1],
+        ),
+    )
+
+
 class PinholeCameraModel:
     """Camera model that focuses on point."""
 

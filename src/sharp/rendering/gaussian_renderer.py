@@ -80,6 +80,7 @@ def render_gaussians(
     min_scale: float = 0.0,
     max_splats: int | None = None,
     prune_score: str = "opacity_scale",
+    sbs_convergence_depth: float = 0.0,
 ) -> None:
     """Render a single gaussian checkpoint file."""
     if metrics:
@@ -149,20 +150,40 @@ def render_gaussians(
             render_timing.start_frame()
         if render_timing:
             with render_timing.timed_cpu("render_setup"):
-                # Treat the trajectory as the *midpoint* between eyes so the midpoint stays centered.
+                if sbs_image_path is not None:
+                    convergence_depth = (
+                        sbs_convergence_depth if sbs_convergence_depth > 0.0 else None
+                    )
+                    camera_info_l, camera_info_r = camera.compute_parallel_stereo_pair(
+                        camera_model,
+                        eye_mid,
+                        baseline,
+                        convergence_depth=convergence_depth,
+                    )
+                else:
+                    # Treat the trajectory as the *midpoint* between eyes so the midpoint stays centered.
+                    eye_position_l = eye_mid.clone()
+                    eye_position_l[0] -= baseline * 0.5
+                    eye_position_r = eye_mid.clone()
+                    eye_position_r[0] += baseline * 0.5
+                    camera_info_l = camera_model.compute(eye_position_l)
+                    camera_info_r = camera_model.compute(eye_position_r)
+        else:
+            if sbs_image_path is not None:
+                convergence_depth = sbs_convergence_depth if sbs_convergence_depth > 0.0 else None
+                camera_info_l, camera_info_r = camera.compute_parallel_stereo_pair(
+                    camera_model,
+                    eye_mid,
+                    baseline,
+                    convergence_depth=convergence_depth,
+                )
+            else:
                 eye_position_l = eye_mid.clone()
                 eye_position_l[0] -= baseline * 0.5
                 eye_position_r = eye_mid.clone()
                 eye_position_r[0] += baseline * 0.5
                 camera_info_l = camera_model.compute(eye_position_l)
                 camera_info_r = camera_model.compute(eye_position_r)
-        else:
-            eye_position_l = eye_mid.clone()
-            eye_position_l[0] -= baseline * 0.5
-            eye_position_r = eye_mid.clone()
-            eye_position_r[0] += baseline * 0.5
-            camera_info_l = camera_model.compute(eye_position_l)
-            camera_info_r = camera_model.compute(eye_position_r)
 
         if render_timing:
             with render_timing.timed_cpu("render_pack_inputs"):
@@ -362,6 +383,7 @@ def render_gaussians_pred_space(
     min_scale: float = 0.0,
     max_splats: int | None = None,
     prune_score: str = "opacity_scale",
+    sbs_convergence_depth: float = 0.0,
 ) -> None:
     """Render predicted-space Gaussians by folding unprojection into the camera."""
     if metrics:
@@ -453,19 +475,39 @@ def render_gaussians_pred_space(
             render_timing.start_frame()
         if render_timing:
             with render_timing.timed_cpu("render_setup"):
+                if sbs_image_path is not None:
+                    convergence_depth = (
+                        sbs_convergence_depth if sbs_convergence_depth > 0.0 else None
+                    )
+                    camera_info_l, camera_info_r = camera.compute_parallel_stereo_pair(
+                        camera_model,
+                        eye_mid,
+                        baseline,
+                        convergence_depth=convergence_depth,
+                    )
+                else:
+                    eye_position_l = eye_mid.clone()
+                    eye_position_l[0] -= baseline * 0.5
+                    eye_position_r = eye_mid.clone()
+                    eye_position_r[0] += baseline * 0.5
+                    camera_info_l = camera_model.compute(eye_position_l)
+                    camera_info_r = camera_model.compute(eye_position_r)
+        else:
+            if sbs_image_path is not None:
+                convergence_depth = sbs_convergence_depth if sbs_convergence_depth > 0.0 else None
+                camera_info_l, camera_info_r = camera.compute_parallel_stereo_pair(
+                    camera_model,
+                    eye_mid,
+                    baseline,
+                    convergence_depth=convergence_depth,
+                )
+            else:
                 eye_position_l = eye_mid.clone()
                 eye_position_l[0] -= baseline * 0.5
                 eye_position_r = eye_mid.clone()
                 eye_position_r[0] += baseline * 0.5
                 camera_info_l = camera_model.compute(eye_position_l)
                 camera_info_r = camera_model.compute(eye_position_r)
-        else:
-            eye_position_l = eye_mid.clone()
-            eye_position_l[0] -= baseline * 0.5
-            eye_position_r = eye_mid.clone()
-            eye_position_r[0] += baseline * 0.5
-            camera_info_l = camera_model.compute(eye_position_l)
-            camera_info_r = camera_model.compute(eye_position_r)
 
         if render_timing:
             with render_timing.timed_cpu("render_pack_inputs"):
