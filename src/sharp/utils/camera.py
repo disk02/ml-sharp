@@ -294,12 +294,16 @@ def compute_parallel_stereo_pair(
     eye_mid: torch.Tensor,
     baseline: float,
     convergence_depth: float | None = None,
+    intrinsics_override: torch.Tensor | None = None,
 ) -> tuple[CameraInfo, CameraInfo]:
     """Compute a parallel stereo pair with off-axis convergence via principal point shift."""
     device = eye_mid.device
     dtype = eye_mid.dtype
 
-    base_intrinsics = camera_model.screen_intrinsics.to(device=device, dtype=dtype).clone()
+    if intrinsics_override is None:
+        base_intrinsics = camera_model.screen_intrinsics.to(device=device, dtype=dtype).clone()
+    else:
+        base_intrinsics = intrinsics_override.to(device=device, dtype=dtype).clone()
     screen_extrinsics = camera_model.screen_extrinsics.to(device=device, dtype=dtype)
 
     origin = (
@@ -405,6 +409,8 @@ def make_cylindrical_rays(
     v = torch.arange(height, device=device, dtype=dtype)
     uu, vv = torch.meshgrid(u, v, indexing="xy")
 
+    # theta=0 is always at the screen center. Per-eye principal-point shifts
+    # are applied in intrinsics and handle off-axis stereo convergence.
     theta = ((uu + 0.5) / width - 0.5) * hfov_rad
     x_img = torch.tan(theta)
     y_img = ((vv + 0.5) - cy) / fy

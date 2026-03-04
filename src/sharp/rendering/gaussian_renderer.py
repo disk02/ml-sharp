@@ -492,11 +492,20 @@ def render_gaussians_pred_space(
                     convergence_depth = (
                         sbs_convergence_depth if sbs_convergence_depth > 0.0 else None
                     )
+                    intrinsics_override = None
+                    if cylindrical:
+                        hfov_rad = np.deg2rad(screen_hfov_deg)
+                        fx_base = (camera_model.screen_resolution_px[0] * 0.5) / np.tan(
+                            hfov_rad * 0.5
+                        )
+                        intrinsics_override = camera_model.screen_intrinsics.clone()
+                        intrinsics_override[0, 0] = fx_base
                     camera_info_l, camera_info_r = camera.compute_parallel_stereo_pair(
                         camera_model,
                         eye_mid,
                         baseline,
                         convergence_depth=convergence_depth,
+                        intrinsics_override=intrinsics_override,
                     )
                 else:
                     eye_position_l = eye_mid.clone()
@@ -508,11 +517,20 @@ def render_gaussians_pred_space(
         else:
             if sbs_image_path is not None:
                 convergence_depth = sbs_convergence_depth if sbs_convergence_depth > 0.0 else None
+                intrinsics_override = None
+                if cylindrical:
+                    hfov_rad = np.deg2rad(screen_hfov_deg)
+                    fx_base = (camera_model.screen_resolution_px[0] * 0.5) / np.tan(
+                        hfov_rad * 0.5
+                    )
+                    intrinsics_override = camera_model.screen_intrinsics.clone()
+                    intrinsics_override[0, 0] = fx_base
                 camera_info_l, camera_info_r = camera.compute_parallel_stereo_pair(
                     camera_model,
                     eye_mid,
                     baseline,
                     convergence_depth=convergence_depth,
+                    intrinsics_override=intrinsics_override,
                 )
             else:
                 eye_position_l = eye_mid.clone()

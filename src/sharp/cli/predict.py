@@ -310,7 +310,7 @@ def resolve_focal_length_mm(
     type=float,
     default=1.0,
     show_default=True,
-    help="Virtual screen distance in meters for cylindrical SBS metadata/logging.",
+    help="Virtual screen distance in meters (currently informational for future calibration).",
 )
 @click.option(
     "--fast-preview-render",

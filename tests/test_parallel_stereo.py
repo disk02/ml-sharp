@@ -102,3 +102,61 @@ def test_make_cylindrical_rays_horizontal_mapping() -> None:
     right_x = rays[height // 2, -1, 0] / rays[height // 2, -1, 2]
     assert torch.allclose(left_x, -expected, atol=1e-4)
     assert torch.allclose(right_x, expected, atol=1e-4)
+
+
+def test_cylindrical_base_intrinsics_cover_requested_hfov() -> None:
+    width, height = 640, 360
+    hfov_deg = 100.0
+    cx = (width - 1) / 2.0
+    fy = 300.0
+
+    rays = make_cylindrical_rays(
+        width=width,
+        height=height,
+        hfov_deg=hfov_deg,
+        fy=fy,
+        cy=(height - 1) / 2.0,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    fx_base = (width * 0.5) / torch.tan(torch.tensor(hfov_deg * torch.pi / 180.0 * 0.5))
+
+    rays_center_row = rays[height // 2]
+    u_in = fx_base * (rays_center_row[:, 0] / rays_center_row[:, 2]) + cx
+
+    eps = 1e-3
+    assert float(u_in.min()) >= -eps
+    assert float(u_in.max()) <= (width - 1) + eps
+
+
+def test_parallel_stereo_pair_intrinsics_override_controls_cx_shift() -> None:
+    scene = _make_scene()
+    intrinsics = torch.tensor(
+        [
+            [900.0, 0.0, 511.5, 0.0],
+            [0.0, 900.0, 383.5, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=torch.float32,
+    )
+    model = create_camera_model(scene, intrinsics, resolution_px=(1024, 768))
+
+    baseline = 0.065
+    convergence_depth = 3.25
+    fx_base = 420.0
+    intrinsics_override = model.screen_intrinsics.clone()
+    intrinsics_override[0, 0] = fx_base
+
+    left, right = compute_parallel_stereo_pair(
+        model,
+        torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32),
+        baseline,
+        convergence_depth=convergence_depth,
+        intrinsics_override=intrinsics_override,
+    )
+
+    expected_shift = fx_base * (baseline * 0.5) / convergence_depth
+    base_cx = float(intrinsics_override[0, 2])
+    assert abs(float(left.intrinsics[0, 2]) - (base_cx + expected_shift)) < 2e-5
+    assert abs(float(right.intrinsics[0, 2]) - (base_cx - expected_shift)) < 2e-5

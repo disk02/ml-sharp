@@ -57,6 +57,8 @@ For curved/VR virtual screens, you can enable cylindrical fast-preview SBS outpu
 sharp predict -i /path/to/input/images -o /path/to/output/gaussians --sbs-image --fast-preview-render --cylindrical --screen-hfov-deg 100 --screen-distance-m 1.0
 ```
 
+`--screen-distance-m` is currently informational (reserved for future physical calibration).
+
 The model checkpoint will be downloaded automatically on first run and cached locally at `~/.cache/torch/hub/checkpoints/`.
 
 Alternatively, you can download the model directly:
