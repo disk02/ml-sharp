@@ -51,6 +51,12 @@ For SBS image preview, SHARP uses parallel stereo cameras with off-axis converge
 sharp predict -i /path/to/input/images -o /path/to/output/gaussians --sbs-image --fast-preview-render --sbs-convergence-depth 3.0
 ```
 
+For curved/VR virtual screens, you can enable cylindrical fast-preview SBS output:
+
+```
+sharp predict -i /path/to/input/images -o /path/to/output/gaussians --sbs-image --fast-preview-render --cylindrical --screen-hfov-deg 100 --screen-distance-m 1.0
+```
+
 The model checkpoint will be downloaded automatically on first run and cached locally at `~/.cache/torch/hub/checkpoints/`.
 
 Alternatively, you can download the model directly:

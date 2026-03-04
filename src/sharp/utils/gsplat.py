@@ -210,6 +210,78 @@ class GSplatRenderer(nn.Module):
             alpha=torch.cat([item.alpha for item in outputs_list], dim=0).contiguous(),
         )
 
+
+    def render_with_rays(
+        self,
+        gaussians: Gaussians3D,
+        extrinsics: torch.Tensor,
+        intrinsics: torch.Tensor,
+        image_width: int,
+        image_height: int,
+        rays_cam: torch.Tensor,
+        want_depth: bool = True,
+        render_timing: RenderTiming | None = None,
+    ) -> RenderingOutputs:
+        """Render by warping pinhole output to custom camera-space rays.
+
+        This is used as a practical fallback for cylindrical projection where
+        gsplat does not expose per-pixel ray inputs.
+        """
+        base = self.forward(
+            gaussians=gaussians,
+            extrinsics=extrinsics,
+            intrinsics=intrinsics,
+            image_width=image_width,
+            image_height=image_height,
+            want_depth=want_depth,
+            render_timing=render_timing,
+        )
+
+        if rays_cam.shape != (image_height, image_width, 3):
+            raise ValueError(
+                f"rays_cam must have shape {(image_height, image_width, 3)}, got {tuple(rays_cam.shape)}"
+            )
+
+        z = rays_cam[..., 2].clamp(min=1e-8)
+        x_img = rays_cam[..., 0] / z
+        y_img = rays_cam[..., 1] / z
+
+        fx = intrinsics[0, 0, 0]
+        fy = intrinsics[0, 1, 1]
+        cx = intrinsics[0, 0, 2]
+        cy = intrinsics[0, 1, 2]
+
+        u = fx * x_img + cx
+        v = fy * y_img + cy
+
+        x_norm = (u / max(image_width - 1, 1)) * 2.0 - 1.0
+        y_norm = (v / max(image_height - 1, 1)) * 2.0 - 1.0
+        grid = torch.stack([x_norm, y_norm], dim=-1).unsqueeze(0)
+
+        warped_color = torch.nn.functional.grid_sample(
+            base.color,
+            grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        )
+        warped_alpha = torch.nn.functional.grid_sample(
+            base.alpha,
+            grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        )
+        warped_depth = torch.nn.functional.grid_sample(
+            base.depth,
+            grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        )
+
+        return RenderingOutputs(color=warped_color, depth=warped_depth, alpha=warped_alpha)
+
     @staticmethod
     def compose_with_background(
         rendered_rgb: torch.Tensor,

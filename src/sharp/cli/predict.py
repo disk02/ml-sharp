@@ -293,6 +293,26 @@ def resolve_focal_length_mm(
     help="Convergence distance (world units) used for off-axis stereo when rendering SBS. 0 = auto.",
 )
 @click.option(
+    "--cylindrical",
+    is_flag=True,
+    default=False,
+    help="Render fast-preview SBS output using cylindrical projection.",
+)
+@click.option(
+    "--screen-hfov-deg",
+    type=float,
+    default=100.0,
+    show_default=True,
+    help="Horizontal field of view in degrees for cylindrical SBS mapping.",
+)
+@click.option(
+    "--screen-distance-m",
+    type=float,
+    default=1.0,
+    show_default=True,
+    help="Virtual screen distance in meters for cylindrical SBS metadata/logging.",
+)
+@click.option(
     "--fast-preview-render",
     is_flag=True,
     default=False,
@@ -413,6 +433,9 @@ def predict_cli(
     sbs_image_frame: int,
     stereo_strength: float,
     sbs_convergence_depth: float,
+    cylindrical: bool,
+    screen_hfov_deg: float,
+    screen_distance_m: float,
     fast_preview_render: bool,
     sbs_min_opacity: float,
     sbs_min_scale: float,
@@ -455,6 +478,16 @@ def predict_cli(
         raise click.BadParameter(
             "must be between 5 and 300 mm.",
             param_hint="--focal-length",
+        )
+    if cylindrical and screen_hfov_deg <= 0.0:
+        raise click.BadParameter(
+            "must be > 0.",
+            param_hint="--screen-hfov-deg",
+        )
+    if cylindrical and screen_distance_m <= 0.0:
+        raise click.BadParameter(
+            "must be > 0.",
+            param_hint="--screen-distance-m",
         )
 
     def _natural_sort_key(path: Path) -> list[tuple[int, object]]:
@@ -683,6 +716,9 @@ def predict_cli(
                     sbs_async_writer=None if fast_preview_compare else sbs_async_writer,
                     stereo_baseline=stereo_strength,
                     sbs_convergence_depth=sbs_convergence_depth,
+                    cylindrical=cylindrical,
+                    screen_hfov_deg=screen_hfov_deg,
+                    screen_distance_m=screen_distance_m,
                     min_opacity=sbs_prune_min_opacity,
                     min_scale=sbs_prune_min_scale,
                     max_splats=sbs_prune_max_splats,

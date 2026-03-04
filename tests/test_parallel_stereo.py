@@ -1,6 +1,10 @@
 import torch
 
-from sharp.utils.camera import compute_parallel_stereo_pair, create_camera_model
+from sharp.utils.camera import (
+    compute_parallel_stereo_pair,
+    create_camera_model,
+    make_cylindrical_rays,
+)
 from sharp.utils.gaussians import Gaussians3D
 
 
@@ -69,3 +73,32 @@ def test_parallel_stereo_pair_zero_baseline_produces_identical_views() -> None:
 
     assert torch.allclose(left.extrinsics, right.extrinsics, atol=1e-6)
     assert torch.allclose(left.intrinsics, right.intrinsics, atol=1e-6)
+
+
+def test_make_cylindrical_rays_horizontal_mapping() -> None:
+    width, height = 101, 51
+    hfov_deg = 100.0
+    fy = 80.0
+    cy = (height - 1) / 2.0
+    rays = make_cylindrical_rays(
+        width=width,
+        height=height,
+        hfov_deg=hfov_deg,
+        fy=fy,
+        cy=cy,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    center = rays[height // 2, width // 2]
+    assert abs(float(center[0])) < 1e-4
+    expected_center_y = ((height // 2 + 0.5) - cy) / fy
+    assert abs(float(center[1] / center[2]) - expected_center_y) < 1e-4
+    assert abs(float(center[2]) - 1.0) < 1e-4
+
+    hfov_rad = hfov_deg * torch.pi / 180.0
+    expected = torch.tan(torch.tensor(float(hfov_rad / 2.0 - hfov_rad / (2.0 * width))))
+    left_x = rays[height // 2, 0, 0] / rays[height // 2, 0, 2]
+    right_x = rays[height // 2, -1, 0] / rays[height // 2, -1, 2]
+    assert torch.allclose(left_x, -expected, atol=1e-4)
+    assert torch.allclose(right_x, expected, atol=1e-4)

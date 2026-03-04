@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io as py_io
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,9 @@ from PIL import Image
 from sharp.utils import camera, gsplat, io
 from sharp.utils.gaussians import Gaussians3D, SceneMetaData, prune_gaussians
 from sharp.utils.metrics import Metrics, RenderTiming
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _save_sbs_image(
@@ -384,6 +388,9 @@ def render_gaussians_pred_space(
     max_splats: int | None = None,
     prune_score: str = "opacity_scale",
     sbs_convergence_depth: float = 0.0,
+    cylindrical: bool = False,
+    screen_hfov_deg: float = 100.0,
+    screen_distance_m: float = 1.0,
 ) -> None:
     """Render predicted-space Gaussians by folding unprojection into the camera."""
     if metrics:
@@ -465,6 +472,12 @@ def render_gaussians_pred_space(
     video_writer = io.VideoWriter(output_path) if sbs_image_path is None else None
     # SBS images don't use depth, so skip depth rendering when no video output is requested.
     want_depth = video_writer is not None
+    if cylindrical and sbs_image_path is not None:
+        LOGGER.info(
+            "Using cylindrical SBS projection (hfov=%.1f deg, distance=%.3f m).",
+            screen_hfov_deg,
+            screen_distance_m,
+        )
 
     for frame_idx, eye_mid in enumerate(trajectory):
         if metrics:
@@ -533,25 +546,65 @@ def render_gaussians_pred_space(
             extrinsics_r = extrinsics_r.to(device) @ u_pred_to_world
             intrinsics_r = intrinsics_r.to(device)
 
-        rendering_output_l = renderer(
-            gaussians_device,
-            extrinsics=extrinsics_l[None],
-            intrinsics=intrinsics_l,
-            image_width=camera_info_l.width,
-            image_height=camera_info_l.height,
-            want_depth=want_depth,
-            render_timing=render_timing,
-        )
+        if cylindrical and sbs_image_path is not None:
+            rays_l = camera.make_cylindrical_rays(
+                width=camera_info_l.width,
+                height=camera_info_l.height,
+                hfov_deg=screen_hfov_deg,
+                fy=float(intrinsics_l[0, 1, 1]),
+                cy=float(intrinsics_l[0, 1, 2]),
+                device=device,
+                dtype=intrinsics_l.dtype,
+            )
+            rays_r = camera.make_cylindrical_rays(
+                width=camera_info_r.width,
+                height=camera_info_r.height,
+                hfov_deg=screen_hfov_deg,
+                fy=float(intrinsics_r[0, 1, 1]),
+                cy=float(intrinsics_r[0, 1, 2]),
+                device=device,
+                dtype=intrinsics_r.dtype,
+            )
+            rendering_output_l = renderer.render_with_rays(
+                gaussians_device,
+                extrinsics=extrinsics_l[None],
+                intrinsics=intrinsics_l,
+                image_width=camera_info_l.width,
+                image_height=camera_info_l.height,
+                rays_cam=rays_l,
+                want_depth=want_depth,
+                render_timing=render_timing,
+            )
+            rendering_output_r = renderer.render_with_rays(
+                gaussians_device,
+                extrinsics=extrinsics_r[None],
+                intrinsics=intrinsics_r,
+                image_width=camera_info_r.width,
+                image_height=camera_info_r.height,
+                rays_cam=rays_r,
+                want_depth=want_depth,
+                render_timing=render_timing,
+            )
+        else:
+            rendering_output_l = renderer(
+                gaussians_device,
+                extrinsics=extrinsics_l[None],
+                intrinsics=intrinsics_l,
+                image_width=camera_info_l.width,
+                image_height=camera_info_l.height,
+                want_depth=want_depth,
+                render_timing=render_timing,
+            )
 
-        rendering_output_r = renderer(
-            gaussians_device,
-            extrinsics=extrinsics_r[None],
-            intrinsics=intrinsics_r,
-            image_width=camera_info_r.width,
-            image_height=camera_info_r.height,
-            want_depth=want_depth,
-            render_timing=render_timing,
-        )
+            rendering_output_r = renderer(
+                gaussians_device,
+                extrinsics=extrinsics_r[None],
+                intrinsics=intrinsics_r,
+                image_width=camera_info_r.width,
+                image_height=camera_info_r.height,
+                want_depth=want_depth,
+                render_timing=render_timing,
+            )
 
         if render_timing:
             with render_timing.gpu_event_timer("render_gpu_raster_blend"):

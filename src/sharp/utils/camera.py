@@ -380,6 +380,40 @@ def compute_parallel_stereo_pair(
     )
 
 
+def make_cylindrical_rays(
+    width: int,
+    height: int,
+    hfov_deg: float,
+    fy: float,
+    cy: float,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Build normalized camera-space rays for cylindrical projection.
+
+    Horizontal coordinates map to yaw angle theta over ``hfov_deg`` while
+    vertical coordinates preserve pinhole mapping from ``fy`` and ``cy``.
+    """
+    if width <= 0 or height <= 0:
+        raise ValueError("width and height must be positive")
+
+    hfov_rad = torch.tensor(hfov_deg * np.pi / 180.0, device=device, dtype=dtype)
+    if hfov_rad <= 0:
+        raise ValueError("hfov_deg must be > 0")
+
+    u = torch.arange(width, device=device, dtype=dtype)
+    v = torch.arange(height, device=device, dtype=dtype)
+    uu, vv = torch.meshgrid(u, v, indexing="xy")
+
+    theta = ((uu + 0.5) / width - 0.5) * hfov_rad
+    x_img = torch.tan(theta)
+    y_img = ((vv + 0.5) - cy) / fy
+
+    rays = torch.stack([x_img, y_img, torch.ones_like(x_img)], dim=-1)
+    rays = rays / rays.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    return rays
+
+
 class PinholeCameraModel:
     """Camera model that focuses on point."""
 
