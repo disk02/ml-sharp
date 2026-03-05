@@ -17,6 +17,7 @@ from .linalg import eyes
 
 TrajetoryType = Literal["swipe", "shake", "rotate", "rotate_forward", "static"]
 LookAtMode = Literal["point", "ahead"]
+StereoMode = Literal["toe_in", "parallel"]
 
 
 @dataclasses.dataclass
@@ -342,16 +343,10 @@ class PinholeCameraModel:
     def compute(self, eye_pos: torch.Tensor) -> CameraInfo:
         """Compute camera for eye position."""
         extrinsics = self.screen_extrinsics.clone()
+        eye_pos = eye_pos.to(device=extrinsics.device, dtype=extrinsics.dtype)
 
-        origin = eye_pos if self.lookat_mode == "ahead" else torch.zeros(3)
-
-        if self.lookat_point is None:
-            depth_focus = max(self.min_depth_focus, self.depth_quantiles.focus)
-            look_at_position = origin + torch.tensor([0.0, 0.0, depth_focus])
-        else:
-            look_at_position = origin + torch.tensor([*self.lookat_point])
-
-        world_up = torch.tensor([0.0, -1.0, 0.0])
+        look_at_position = self._compute_look_at_position(eye_pos)
+        world_up = torch.tensor([0.0, -1.0, 0.0], device=eye_pos.device, dtype=eye_pos.dtype)
         extrinsics_modifier = create_camera_matrix(
             eye_pos, look_at_position, world_up, inverse=True
         )
@@ -364,6 +359,107 @@ class PinholeCameraModel:
             height=self.screen_resolution_px[1],
         )
         return camera_info
+
+    def resolve_convergence_depth(
+        self,
+        stereo_convergence_depth: float | None,
+        stereo_convergence_norm: float | None,
+    ) -> float | None:
+        """Resolve convergence depth from explicit depth or normalized focus depth."""
+        if stereo_convergence_depth is not None and stereo_convergence_depth > 0:
+            return float(stereo_convergence_depth)
+        if stereo_convergence_norm is not None and stereo_convergence_norm > 0:
+            depth_focus = max(self.min_depth_focus, self.depth_quantiles.focus)
+            return float(stereo_convergence_norm) * float(depth_focus)
+        return None
+
+    def compute_stereo_pair(
+        self,
+        eye_mid: torch.Tensor,
+        baseline: float,
+        stereo_mode: StereoMode = "toe_in",
+        stereo_convergence_depth: float | None = None,
+        stereo_convergence_norm: float | None = None,
+    ) -> tuple[CameraInfo, CameraInfo]:
+        """Compute left/right camera pair for the given midpoint eye position."""
+        eye_mid = eye_mid.to(
+            device=self.screen_extrinsics.device,
+            dtype=self.screen_extrinsics.dtype,
+        )
+
+        eye_position_l = eye_mid.clone()
+        eye_position_l[0] -= baseline * 0.5
+        eye_position_r = eye_mid.clone()
+        eye_position_r[0] += baseline * 0.5
+
+        if stereo_mode == "toe_in":
+            return self.compute(eye_position_l), self.compute(eye_position_r)
+        if stereo_mode != "parallel":
+            raise ValueError(f"Unsupported stereo mode: {stereo_mode}")
+
+        look_at_position = self._compute_look_at_position(eye_mid)
+        world_up = torch.tensor([0.0, -1.0, 0.0], device=eye_mid.device, dtype=eye_mid.dtype)
+        extrinsics_mid = (
+            create_camera_matrix(eye_mid, look_at_position, world_up, inverse=True)
+            @ self.screen_extrinsics
+        )
+        rotation = extrinsics_mid[:3, :3]
+
+        extrinsics_l = extrinsics_mid.clone()
+        extrinsics_r = extrinsics_mid.clone()
+        extrinsics_l[:3, 3] = -(rotation @ eye_position_l)
+        extrinsics_r[:3, 3] = -(rotation @ eye_position_r)
+
+        intrinsics_l = self.screen_intrinsics.clone()
+        intrinsics_r = self.screen_intrinsics.clone()
+
+        convergence_depth = self.resolve_convergence_depth(
+            stereo_convergence_depth=stereo_convergence_depth,
+            stereo_convergence_norm=stereo_convergence_norm,
+        )
+        if convergence_depth is not None:
+            zc = torch.tensor(
+                convergence_depth,
+                device=intrinsics_l.device,
+                dtype=intrinsics_l.dtype,
+            )
+            shift_px = intrinsics_l[0, 0] * (baseline * 0.5) / zc
+            intrinsics_l[0, 2] -= shift_px
+            intrinsics_r[0, 2] += shift_px
+
+        return (
+            CameraInfo(
+                intrinsics=intrinsics_l,
+                extrinsics=extrinsics_l,
+                width=self.screen_resolution_px[0],
+                height=self.screen_resolution_px[1],
+            ),
+            CameraInfo(
+                intrinsics=intrinsics_r,
+                extrinsics=extrinsics_r,
+                width=self.screen_resolution_px[0],
+                height=self.screen_resolution_px[1],
+            ),
+        )
+
+    def _compute_look_at_position(self, eye_pos: torch.Tensor) -> torch.Tensor:
+        """Compute look-at target for the current camera configuration."""
+        origin = (
+            eye_pos
+            if self.lookat_mode == "ahead"
+            else torch.zeros_like(eye_pos, device=eye_pos.device, dtype=eye_pos.dtype)
+        )
+
+        if self.lookat_point is None:
+            depth_focus = max(self.min_depth_focus, self.depth_quantiles.focus)
+            look_at_position = origin + torch.tensor(
+                [0.0, 0.0, depth_focus], device=eye_pos.device, dtype=eye_pos.dtype
+            )
+        else:
+            look_at_position = origin + torch.tensor(
+                [*self.lookat_point], device=eye_pos.device, dtype=eye_pos.dtype
+            )
+        return look_at_position
 
     def set_screen_extrinsics(self, new_value: torch.Tensor) -> None:
         """Modify the default extrinsics."""

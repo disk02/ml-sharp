@@ -358,6 +358,9 @@ def render_gaussians_pred_space(
     metrics: Metrics | None = None,
     sbs_async_writer: Any | None = None,
     stereo_baseline: float = 0.065,
+    stereo_mode: camera.StereoMode = "toe_in",
+    stereo_convergence_depth: float | None = None,
+    stereo_convergence_norm: float | None = None,
     min_opacity: float = 0.0,
     min_scale: float = 0.0,
     max_splats: int | None = None,
@@ -453,19 +456,21 @@ def render_gaussians_pred_space(
             render_timing.start_frame()
         if render_timing:
             with render_timing.timed_cpu("render_setup"):
-                eye_position_l = eye_mid.clone()
-                eye_position_l[0] -= baseline * 0.5
-                eye_position_r = eye_mid.clone()
-                eye_position_r[0] += baseline * 0.5
-                camera_info_l = camera_model.compute(eye_position_l)
-                camera_info_r = camera_model.compute(eye_position_r)
+                camera_info_l, camera_info_r = camera_model.compute_stereo_pair(
+                    eye_mid,
+                    baseline=baseline,
+                    stereo_mode=stereo_mode,
+                    stereo_convergence_depth=stereo_convergence_depth,
+                    stereo_convergence_norm=stereo_convergence_norm,
+                )
         else:
-            eye_position_l = eye_mid.clone()
-            eye_position_l[0] -= baseline * 0.5
-            eye_position_r = eye_mid.clone()
-            eye_position_r[0] += baseline * 0.5
-            camera_info_l = camera_model.compute(eye_position_l)
-            camera_info_r = camera_model.compute(eye_position_r)
+            camera_info_l, camera_info_r = camera_model.compute_stereo_pair(
+                eye_mid,
+                baseline=baseline,
+                stereo_mode=stereo_mode,
+                stereo_convergence_depth=stereo_convergence_depth,
+                stereo_convergence_norm=stereo_convergence_norm,
+            )
 
         if render_timing:
             with render_timing.timed_cpu("render_pack_inputs"):
