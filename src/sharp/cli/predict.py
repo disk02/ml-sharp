@@ -292,6 +292,31 @@ def resolve_focal_length_mm(
     help="Render SBS preview using predicted-space gaussians (skips world conversion).",
 )
 @click.option(
+    "--stereo-mode",
+    type=click.Choice(["toe_in", "parallel"], case_sensitive=False),
+    default="toe_in",
+    show_default=True,
+    help="Stereo camera mode for SBS fast preview rendering.",
+)
+@click.option(
+    "--stereo-convergence-depth",
+    type=float,
+    default=None,
+    help=(
+        "Optional convergence plane depth in world/model units for --stereo-mode=parallel. "
+        "Ignored for toe_in."
+    ),
+)
+@click.option(
+    "--stereo-convergence-norm",
+    type=float,
+    default=None,
+    help=(
+        "Optional convergence depth multiplier applied to the scene focus depth for "
+        "--stereo-mode=parallel. Ignored for toe_in and overridden by --stereo-convergence-depth."
+    ),
+)
+@click.option(
     "--sbs-min-opacity",
     type=float,
     default=0.0,
@@ -406,6 +431,9 @@ def predict_cli(
     sbs_image_frame: int,
     stereo_strength: float,
     fast_preview_render: bool,
+    stereo_mode: str,
+    stereo_convergence_depth: float | None,
+    stereo_convergence_norm: float | None,
     sbs_min_opacity: float,
     sbs_min_scale: float,
     sbs_max_splats: int | None,
@@ -547,6 +575,28 @@ def predict_cli(
     if fast_preview_render and not want_sbs_image:
         LOGGER.warning("--fast-preview-render is only used with --sbs-image. Disabling.")
         fast_preview_render = False
+    stereo_mode = stereo_mode.lower()
+    if stereo_convergence_depth is not None and stereo_convergence_depth <= 0:
+        raise click.BadParameter(
+            "must be greater than 0.",
+            param_hint="--stereo-convergence-depth",
+        )
+    if stereo_convergence_norm is not None and stereo_convergence_norm <= 0:
+        raise click.BadParameter(
+            "must be greater than 0.",
+            param_hint="--stereo-convergence-norm",
+        )
+    if stereo_mode != "parallel" and (
+        stereo_convergence_depth is not None or stereo_convergence_norm is not None
+    ):
+        LOGGER.warning(
+            "--stereo-convergence-* only applies to --stereo-mode=parallel; ignoring convergence "
+            "controls in %s mode.",
+            stereo_mode,
+        )
+    if stereo_mode != "parallel":
+        stereo_convergence_depth = None
+        stereo_convergence_norm = None
     if fast_preview_compare and not want_sbs_image:
         raise click.ClickException("--fast-preview-compare requires --sbs-image.")
     if fast_preview_compare and not fast_preview_render:
@@ -673,6 +723,9 @@ def predict_cli(
                     metrics=metrics,
                     sbs_async_writer=None if fast_preview_compare else sbs_async_writer,
                     stereo_baseline=stereo_strength,
+                    stereo_mode=stereo_mode,
+                    stereo_convergence_depth=stereo_convergence_depth,
+                    stereo_convergence_norm=stereo_convergence_norm,
                     min_opacity=sbs_prune_min_opacity,
                     min_scale=sbs_prune_min_scale,
                     max_splats=sbs_prune_max_splats,
