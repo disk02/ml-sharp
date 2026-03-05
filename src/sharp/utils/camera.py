@@ -399,13 +399,14 @@ class PinholeCameraModel:
 
         look_at_position = self._compute_look_at_position(eye_mid)
         world_up = torch.tensor([0.0, -1.0, 0.0], device=eye_mid.device, dtype=eye_mid.dtype)
-        extrinsics_mid = create_camera_matrix(eye_mid, look_at_position, world_up, inverse=True)
+        extrinsics_mid = (
+            create_camera_matrix(eye_mid, look_at_position, world_up, inverse=True)
+            @ self.screen_extrinsics
+        )
         rotation = extrinsics_mid[:3, :3]
 
-        extrinsics_l = self.screen_extrinsics.clone()
-        extrinsics_r = self.screen_extrinsics.clone()
-        extrinsics_l[:3, :3] = rotation
-        extrinsics_r[:3, :3] = rotation
+        extrinsics_l = extrinsics_mid.clone()
+        extrinsics_r = extrinsics_mid.clone()
         extrinsics_l[:3, 3] = -(rotation @ eye_position_l)
         extrinsics_r[:3, 3] = -(rotation @ eye_position_r)
 
