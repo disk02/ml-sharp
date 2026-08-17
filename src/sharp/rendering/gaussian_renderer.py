@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import io as py_io
 from contextlib import nullcontext
 from pathlib import Path
@@ -260,10 +261,7 @@ def _render_stereo_outputs(
         # Only add to video if video writer was created
         if video_writer is not None:
             depth = torch.cat((depth_l, depth_r), dim=0)
-            if render_timing:
-                video_writer.add_frame(color, depth, render_timing=render_timing)
-            else:
-                video_writer.add_frame(color, depth)
+            video_writer.add_frame(color, depth, render_timing=render_timing)
         if render_timing:
             render_timing.finalize_frame()
 
@@ -284,7 +282,7 @@ def render_gaussians(
     align_crop: bool = False,
     metrics: Metrics | None = None,
     sbs_async_writer: Any | None = None,
-    stereo_baseline: float = 0.065,
+    stereo_baseline: float = camera.DEFAULT_STEREO_BASELINE,
     stereo_mode: camera.StereoMode = "toe_in",
     stereo_convergence_depth: float | None = None,
     stereo_convergence_norm: float | None = None,
@@ -321,15 +319,15 @@ def render_gaussians(
     )
 
     # Number of camera animation loops.
-    params.num_repeats = 3
+    render_params = dataclasses.replace(params, num_repeats=3)
 
     # Use static trajectory for SBS image mode
     if sbs_image_path is not None:
-        params.type = "static"
+        render_params = dataclasses.replace(render_params, type="static")
         sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
 
     trajectory = camera.create_eye_trajectory(
-        gaussians_device, params, resolution_px=metadata.resolution_px, f_px=f_px
+        gaussians_device, render_params, resolution_px=metadata.resolution_px, f_px=f_px
     )
     renderer = gsplat.GSplatRenderer(color_space=metadata.color_space)
 
@@ -368,7 +366,7 @@ def render_gaussians_pred_space(
     align_crop: bool = False,
     metrics: Metrics | None = None,
     sbs_async_writer: Any | None = None,
-    stereo_baseline: float = 0.065,
+    stereo_baseline: float = camera.DEFAULT_STEREO_BASELINE,
     stereo_mode: camera.StereoMode = "toe_in",
     stereo_convergence_depth: float | None = None,
     stereo_convergence_norm: float | None = None,
@@ -377,7 +375,12 @@ def render_gaussians_pred_space(
     max_splats: int | None = None,
     prune_score: str = "opacity_scale",
 ) -> None:
-    """Render predicted-space Gaussians by folding unprojection into the camera."""
+    """Render predicted-space Gaussians by folding unprojection into the camera.
+
+    Note: `sharp predict` only uses this for SBS image output; video trajectories
+    are rendered in world space via render_gaussians. Video output here is
+    library API surface.
+    """
     if metrics:
         metrics.inc("render_calls")
     (width, height) = metadata.resolution_px
@@ -407,13 +410,14 @@ def render_gaussians_pred_space(
         camera_stats_scene, intrinsics, resolution_px=metadata.resolution_px
     )
 
-    params.num_repeats = 3
+    # Number of camera animation loops.
+    render_params = dataclasses.replace(params, num_repeats=3)
     if sbs_image_path is not None:
-        params.type = "static"
+        render_params = dataclasses.replace(render_params, type="static")
         sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
 
     trajectory = camera.create_eye_trajectory(
-        camera_stats_scene, params, resolution_px=metadata.resolution_px, f_px=f_px
+        camera_stats_scene, render_params, resolution_px=metadata.resolution_px, f_px=f_px
     )
     renderer = gsplat.GSplatRenderer(color_space=metadata.color_space)
 

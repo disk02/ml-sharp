@@ -19,6 +19,9 @@ TrajetoryType = Literal["swipe", "shake", "rotate", "rotate_forward", "static"]
 LookAtMode = Literal["point", "ahead"]
 StereoMode = Literal["toe_in", "parallel"]
 
+# Default stereo baseline (world units) for SBS rendering when none is provided.
+DEFAULT_STEREO_BASELINE = 0.065
+
 
 @dataclasses.dataclass
 class CameraInfo:
