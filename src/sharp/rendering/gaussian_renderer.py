@@ -11,7 +11,12 @@ import torch
 from PIL import Image
 
 from sharp.utils import camera, gsplat, io
-from sharp.utils.gaussians import Gaussians3D, SceneMetaData, prune_gaussians
+from sharp.utils.gaussians import (
+    Gaussians3D,
+    SceneMetaData,
+    build_camera_stats_scene,
+    prune_gaussians,
+)
 from sharp.utils.metrics import Metrics, RenderTiming
 
 
@@ -406,33 +411,9 @@ def render_gaussians_pred_space(
     )
     u_pred_to_world = unprojection_matrix.to(device=device, dtype=torch.float32)
 
-    mean_vectors = gaussians_device.mean_vectors
-    if mean_vectors.ndim == 3:
-        mean_vectors = mean_vectors[0]
-    num_points = int(mean_vectors.shape[0])
-    sample_size = min(16384, num_points)
-    sample_idx = torch.randint(0, num_points, (sample_size,), device=mean_vectors.device)
-    mean_sample = mean_vectors[sample_idx]
-    mean_sample_world = mean_sample @ u_pred_to_world[:3, :3].T + u_pred_to_world[:3, 3]
-    mean_sample_world = mean_sample_world.unsqueeze(0)
-    quaternions = gaussians_device.quaternions
-    singular_values = gaussians_device.singular_values
-    colors = gaussians_device.colors
-    opacities = gaussians_device.opacities
-    if quaternions.ndim == 3:
-        quaternions = quaternions[0][sample_idx].unsqueeze(0)
-        singular_values = singular_values[0][sample_idx].unsqueeze(0)
-        colors = colors[0][sample_idx].unsqueeze(0)
-        opacities = opacities[0][sample_idx].unsqueeze(0)
-    gaussians_camera_sample = Gaussians3D(
-        mean_vectors=mean_sample_world,
-        singular_values=singular_values,
-        quaternions=quaternions,
-        colors=colors,
-        opacities=opacities,
-    )
+    camera_stats_scene = build_camera_stats_scene(gaussians_device, u_pred_to_world)
     camera_model = camera.create_camera_model(
-        gaussians_camera_sample, intrinsics, resolution_px=metadata.resolution_px
+        camera_stats_scene, intrinsics, resolution_px=metadata.resolution_px
     )
 
     # Stereo baseline (world units in the model's coordinate system). Configurable so SBS
@@ -444,7 +425,7 @@ def render_gaussians_pred_space(
         sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
 
     trajectory = camera.create_eye_trajectory(
-        gaussians_camera_sample, params, resolution_px=metadata.resolution_px, f_px=f_px
+        camera_stats_scene, params, resolution_px=metadata.resolution_px, f_px=f_px
     )
     renderer = gsplat.GSplatRenderer(color_space=metadata.color_space)
     render_timing = metrics.render_timing if metrics else None
