@@ -93,3 +93,41 @@ def test_parallel_stereo_preserves_screen_extrinsics_composition() -> None:
     assert torch.allclose(right.extrinsics[:3, :3], expected_rotation)
     assert torch.allclose(left.extrinsics[:3, 3], -(expected_rotation @ eye_left))
     assert torch.allclose(right.extrinsics[:3, 3], -(expected_rotation @ eye_right))
+
+
+def test_toe_in_stereo_matches_individual_eye_computes() -> None:
+    angle = torch.tensor(0.2, dtype=torch.float32)
+    cos = torch.cos(angle)
+    sin = torch.sin(angle)
+    screen_extrinsics = torch.tensor(
+        [
+            [cos, -sin, 0.0, 0.1],
+            [sin, cos, 0.0, -0.2],
+            [0.0, 0.0, 1.0, 0.3],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=torch.float32,
+    )
+    model = _camera_model(screen_extrinsics=screen_extrinsics)
+
+    eye_mid = torch.tensor([0.25, -0.1, 0.4], dtype=torch.float32)
+    baseline = 0.15
+
+    left, right = model.compute_stereo_pair(
+        eye_mid=eye_mid,
+        baseline=baseline,
+        stereo_mode="toe_in",
+    )
+
+    eye_left = eye_mid.clone()
+    eye_left[0] -= baseline * 0.5
+    eye_right = eye_mid.clone()
+    eye_right[0] += baseline * 0.5
+
+    expected_left = model.compute(eye_left)
+    expected_right = model.compute(eye_right)
+
+    assert torch.allclose(left.extrinsics, expected_left.extrinsics)
+    assert torch.allclose(right.extrinsics, expected_right.extrinsics)
+    assert torch.allclose(left.intrinsics, expected_left.intrinsics)
+    assert torch.allclose(right.intrinsics, expected_right.intrinsics)

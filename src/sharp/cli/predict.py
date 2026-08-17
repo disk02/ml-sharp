@@ -597,6 +597,11 @@ def predict_cli(
     if stereo_mode != "parallel":
         stereo_convergence_depth = None
         stereo_convergence_norm = None
+    if want_render_trajectory and not want_sbs_image and stereo_mode != "toe_in":
+        LOGGER.warning(
+            "--stereo-mode=%s only applies to --sbs-image output; --render video will use toe_in.",
+            stereo_mode,
+        )
     if fast_preview_compare and not want_sbs_image:
         raise click.ClickException("--fast-preview-compare requires --sbs-image.")
     if fast_preview_compare and not fast_preview_render:
@@ -705,6 +710,9 @@ def predict_cli(
                         metrics=metrics,
                         sbs_async_writer=None,
                         stereo_baseline=stereo_strength,
+                        stereo_mode=stereo_mode,
+                        stereo_convergence_depth=stereo_convergence_depth,
+                        stereo_convergence_norm=stereo_convergence_norm,
                         min_opacity=sbs_prune_min_opacity,
                         min_scale=sbs_prune_min_scale,
                         max_splats=sbs_prune_max_splats,
@@ -765,6 +773,13 @@ def predict_cli(
                     metrics=metrics,
                     sbs_async_writer=sbs_async_writer,
                     stereo_baseline=stereo_strength if sbs_image_path is not None else 0.065,
+                    stereo_mode=stereo_mode if sbs_image_path is not None else "toe_in",
+                    stereo_convergence_depth=(
+                        stereo_convergence_depth if sbs_image_path is not None else None
+                    ),
+                    stereo_convergence_norm=(
+                        stereo_convergence_norm if sbs_image_path is not None else None
+                    ),
                     min_opacity=sbs_prune_min_opacity,
                     min_scale=sbs_prune_min_scale,
                     max_splats=sbs_prune_max_splats,
