@@ -29,6 +29,7 @@ from sharp.models import (
     RGBGaussianPredictor,
     create_predictor,
 )
+from sharp.utils import camera
 from sharp.utils import io
 from sharp.utils import logging as logging_utils
 from sharp.utils.gaussians import (
@@ -273,16 +274,16 @@ def resolve_focal_length_mm(
     type=int,
     default=0,
     show_default=True,
-    help="Which frame index to save for --sbs-image.",
+    help="Frame index to save for --sbs-image (ignored: predict renders one static frame).",
 )
 @click.option(
     "--stereo-strength",
     type=float,
-    default=0.065,
+    default=camera.DEFAULT_STEREO_BASELINE,
     show_default=True,
     help=(
-        "Absolute stereo baseline for SBS rendering (world units, default 0.065). "
-        "Only used with --sbs-image."
+        f"Absolute stereo baseline for SBS rendering (world units, default "
+        f"{camera.DEFAULT_STEREO_BASELINE}). Only used with --sbs-image."
     ),
 )
 @click.option(
@@ -610,6 +611,8 @@ def predict_cli(
     effective_stereo_mode = "toe_in" if video_only else stereo_mode
     effective_stereo_convergence_depth = None if video_only else stereo_convergence_depth
     effective_stereo_convergence_norm = None if video_only else stereo_convergence_norm
+    if want_sbs_image and sbs_image_frame != 0:
+        LOGGER.warning("--sbs-image-frame is ignored: predict SBS output is a single static frame.")
     if fast_preview_compare and not want_sbs_image:
         raise click.ClickException("--fast-preview-compare requires --sbs-image.")
     if fast_preview_compare and not fast_preview_render:
@@ -675,12 +678,10 @@ def predict_cli(
                 sbs_image_path.parent.mkdir(parents=True, exist_ok=True)
 
         if want_render_trajectory or sbs_image_path is not None:
+            # Placeholder path; render_gaussians will not write video when sbs_image_path is set.
+            output_video_path = (out_dir / image_path.stem).with_suffix(".mp4")
             if want_render_trajectory:
-                output_video_path = (out_dir / image_path.stem).with_suffix(".mp4")
                 LOGGER.info("Rendering trajectory to %s", output_video_path)
-            else:
-                # Placeholder path; render_gaussians will not write video when sbs_image_path is set.
-                output_video_path = (out_dir / image_path.stem).with_suffix(".mp4")
 
             metadata = SceneMetaData(intrinsics[0, 0].item(), (width, height), "linearRGB")
 

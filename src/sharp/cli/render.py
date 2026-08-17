@@ -68,7 +68,7 @@ def _resolve_sbs_image_path(
     "--sbs-image-frame",
     type=int,
     default=0,
-    help="Frame index to save for --sbs-image (default: 0).",
+    help="Frame index to save for --sbs-image (ignored: renders one static frame; default: 0).",
 )
 def render_cli(
     input_path: Path,
@@ -86,6 +86,9 @@ def render_cli(
 
     output_path.mkdir(exist_ok=True, parents=True)
     params = camera.TrajectoryParams()
+
+    if sbs_image is not None and sbs_image_frame != 0:
+        LOGGER.warning("--sbs-image-frame is ignored: --sbs-image output is a single static frame.")
 
     if input_path.suffix == ".ply":
         scene_paths = [input_path]
