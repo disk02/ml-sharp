@@ -352,12 +352,6 @@ def resolve_focal_length_mm(
     help="Score used to pick top-K SBS splats (opacity or opacity_scale). Only used with --sbs-image.",
 )
 @click.option(
-    "--align-crop",
-    is_flag=True,
-    default=False,
-    help="If set, auto-align and auto-crop the SBS stereo pair before saving the SBS image.",
-)
-@click.option(
     "--fast-preview-compare",
     is_flag=True,
     default=False,
@@ -439,7 +433,6 @@ def predict_cli(
     sbs_min_scale: float,
     sbs_max_splats: int | None,
     sbs_prune_score: str,
-    align_crop: bool,
     fast_preview_compare: bool,
     save_ply: bool | None,
     skip_world_conversion: bool,
@@ -715,7 +708,6 @@ def predict_cli(
                         sbs_image_format=effective_sbs_format,
                         sbs_jpeg_quality=sbs_jpeg_quality,
                         sbs_image_frame=sbs_image_frame,
-                        align_crop=align_crop,
                         metrics=metrics,
                         sbs_async_writer=None,
                         stereo_baseline=stereo_strength,
@@ -736,7 +728,6 @@ def predict_cli(
                     sbs_image_format=effective_sbs_format,
                     sbs_jpeg_quality=sbs_jpeg_quality,
                     sbs_image_frame=sbs_image_frame,
-                    align_crop=align_crop,
                     metrics=metrics,
                     sbs_async_writer=None if fast_preview_compare else sbs_async_writer,
                     stereo_baseline=stereo_strength,
@@ -778,7 +769,6 @@ def predict_cli(
                     sbs_image_format=effective_sbs_format,
                     sbs_jpeg_quality=sbs_jpeg_quality,
                     sbs_image_frame=sbs_image_frame,
-                    align_crop=align_crop,
                     metrics=metrics,
                     sbs_async_writer=sbs_async_writer,
                     stereo_baseline=stereo_strength,

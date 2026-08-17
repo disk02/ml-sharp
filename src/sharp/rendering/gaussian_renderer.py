@@ -97,10 +97,9 @@ def _save_sbs_image(
 def _finalize_sbs_frame(
     color_l: torch.Tensor,
     color_r: torch.Tensor,
-    align_crop: bool,
     render_timing: RenderTiming | None,
 ) -> np.ndarray:
-    """Pack rendered left/right frames into an SBS array, optionally aligning first."""
+    """Pack rendered left/right frames into an SBS array."""
     with _timed_cpu(render_timing, "render_d2h_transfer"):
         height, width, _channels = color_l.shape
         color_sbs_u8 = torch.empty(
@@ -109,29 +108,6 @@ def _finalize_sbs_frame(
         color_sbs_u8[:, :width, :] = color_l
         color_sbs_u8[:, width:, :] = color_r
         color_sbs_np = color_sbs_u8.cpu().numpy()
-
-    with _timed_cpu(render_timing, "render_encode_prepare"):
-        if align_crop:
-            # Import lazily so OpenCV isn't required unless --align-crop is used.
-            try:
-                from sharp.utils.stereo_align import AlignParams, auto_align_and_crop
-            except ImportError as e:  # pragma: no cover
-                raise RuntimeError(
-                    "Stereo auto-alignment requires OpenCV. Install opencv-python "
-                    "(or opencv-python-headless), or omit --align-crop."
-                ) from e
-
-            # Auto-align + auto-crop the stereo pair, then re-pack SBS for output.
-            align_params = AlignParams()
-            color_l_np, color_r_np, _meta = auto_align_and_crop(
-                color_sbs_np[:, :width, :],
-                color_sbs_np[:, width:, :],
-                params=align_params,
-            )
-            height, width, _channels = color_l_np.shape
-            color_sbs_np = np.empty((height, width * 2, 3), dtype=np.uint8)
-            color_sbs_np[:, :width, :] = color_l_np
-            color_sbs_np[:, width:, :] = color_r_np
     return color_sbs_np
 
 
@@ -147,7 +123,6 @@ def _render_stereo_outputs(
     sbs_image_format: str | None,
     sbs_jpeg_quality: int,
     sbs_image_frame: int,
-    align_crop: bool,
     stereo_baseline: float,
     stereo_mode: camera.StereoMode,
     stereo_convergence_depth: float | None,
@@ -240,7 +215,7 @@ def _render_stereo_outputs(
 
         # Write SBS frame image if requested
         if sbs_image_path is not None and frame_idx == sbs_image_frame:
-            color_sbs_np = _finalize_sbs_frame(color_l, color_r, align_crop, render_timing)
+            color_sbs_np = _finalize_sbs_frame(color_l, color_r, render_timing)
             img = (
                 color_sbs_np
                 if sbs_async_writer is not None
@@ -279,7 +254,6 @@ def render_gaussians(
     sbs_image_format: str | None = None,
     sbs_jpeg_quality: int = 90,
     sbs_image_frame: int = 0,
-    align_crop: bool = False,
     metrics: Metrics | None = None,
     sbs_async_writer: Any | None = None,
     stereo_baseline: float = camera.DEFAULT_STEREO_BASELINE,
@@ -343,7 +317,6 @@ def render_gaussians(
         sbs_image_format=sbs_image_format,
         sbs_jpeg_quality=sbs_jpeg_quality,
         sbs_image_frame=sbs_image_frame,
-        align_crop=align_crop,
         stereo_baseline=stereo_baseline,
         stereo_mode=stereo_mode,
         stereo_convergence_depth=stereo_convergence_depth,
@@ -363,7 +336,6 @@ def render_gaussians_pred_space(
     sbs_image_format: str | None = None,
     sbs_jpeg_quality: int = 90,
     sbs_image_frame: int = 0,
-    align_crop: bool = False,
     metrics: Metrics | None = None,
     sbs_async_writer: Any | None = None,
     stereo_baseline: float = camera.DEFAULT_STEREO_BASELINE,
@@ -433,7 +405,6 @@ def render_gaussians_pred_space(
         sbs_image_format=sbs_image_format,
         sbs_jpeg_quality=sbs_jpeg_quality,
         sbs_image_frame=sbs_image_frame,
-        align_crop=align_crop,
         stereo_baseline=stereo_baseline,
         stereo_mode=stereo_mode,
         stereo_convergence_depth=stereo_convergence_depth,
