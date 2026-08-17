@@ -186,7 +186,8 @@ change_settings_menu() {
     echo "  12) toggle --fast-preview-render"
     echo "  13) done"
     echo
-    read -r -p "Select an option [1-13]: " choice
+    read -r -p "Select an option [1-13] (default 13): " choice
+    choice="${choice:-13}"
 
     case "$choice" in
       1) INPUT_DIR="$(prompt_nonempty 'New input dir: ')" ;;

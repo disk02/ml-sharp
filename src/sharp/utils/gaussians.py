@@ -282,6 +282,62 @@ def apply_transform(
     )
 
 
+def build_camera_stats_scene(
+    gaussians: Gaussians3D,
+    unprojection_matrix: torch.Tensor,
+    sample_size: int = 16384,
+) -> Gaussians3D:
+    """Build a deterministic world-space subset of Gaussians for camera statistics.
+
+    Camera statistics (depth quantiles, trajectory extents) depend only on splat
+    mean positions. This transforms the means to world space and keeps at most
+    ``sample_size`` points chosen with a fixed stride, so results are identical
+    across runs without invoking any random number generators.
+
+    Args:
+        gaussians: The Gaussians (batched or unbatched) to build statistics for.
+        unprojection_matrix: A 4x4 matrix transforming from NDC to world space.
+        sample_size: The maximum number of points to include.
+
+    Returns:
+        An unbatched Gaussians3D containing world-space means for camera statistics.
+    """
+    mean_vectors = gaussians.mean_vectors
+    singular_values = gaussians.singular_values
+    quaternions = gaussians.quaternions
+    colors = gaussians.colors
+    opacities = gaussians.opacities
+    if mean_vectors.ndim == 3:
+        mean_vectors = mean_vectors[0]
+        singular_values = singular_values[0]
+        quaternions = quaternions[0]
+        colors = colors[0]
+        opacities = opacities[0]
+
+    num_points = int(mean_vectors.shape[0])
+    if num_points > sample_size:
+        step = max(num_points // sample_size, 1)
+        sample_idx = torch.arange(0, num_points, step, device=mean_vectors.device)
+        sample_idx = sample_idx[:sample_size]
+        mean_vectors = mean_vectors[sample_idx]
+        singular_values = singular_values[sample_idx]
+        quaternions = quaternions[sample_idx]
+        colors = colors[sample_idx]
+        opacities = opacities[sample_idx]
+
+    transform_linear = unprojection_matrix[:3, :3]
+    transform_offset = unprojection_matrix[:3, 3]
+    mean_vectors = mean_vectors @ transform_linear.T + transform_offset
+
+    return Gaussians3D(
+        mean_vectors=mean_vectors,
+        singular_values=singular_values,
+        quaternions=quaternions,
+        colors=colors,
+        opacities=opacities,
+    )
+
+
 def decompose_covariance_matrices(
     covariance_matrices: torch.Tensor,
     metrics: Metrics | None = None,
