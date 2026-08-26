@@ -27,6 +27,7 @@ def create_initializer(params: InitializerParams) -> nn.Module:
         rest_layer_depth_option=params.rest_layer_depth_option,
         normalize_depth=params.normalize_depth,
         feature_input_stop_grad=params.feature_input_stop_grad,
+        edge_ring=params.edge_cover.enabled,
     )
 
 
@@ -84,6 +85,7 @@ class MultiLayerInitializer(nn.Module):
         rest_layer_depth_option: DepthInitOption = "surface_min",
         normalize_depth: bool = True,
         feature_input_stop_grad: bool = True,
+        edge_ring: bool = True,
     ) -> None:
         """Initialize MultilayerInitializer.
 
@@ -100,6 +102,13 @@ class MultiLayerInitializer(nn.Module):
             normalize_depth: # Whether to normalize depth to [DepthTransformParam.depth_min,
                 DepthTransformParam.depth_max).
             feature_input_stop_grad: Whether to not propagate gradients through feature inputs.
+            edge_ring: Whether to snap the outermost row/column of the stride
+                grid to the frame boundary (NDC -1.0 / +1.0) so that the last
+                sampled point reaches the pixel rim. This closes the "dark
+                fringe" guarantee at every frame edge (Defect 1).
+                Defaults to True; pass False to restore the original
+                behaviour in which every edge stops one pixel inside the
+                frame.
         """
         super().__init__()
         self.num_layers = num_layers
@@ -112,6 +121,7 @@ class MultiLayerInitializer(nn.Module):
         self.rest_layer_depth_option = rest_layer_depth_option
         self.normalize_depth = normalize_depth
         self.feature_input_stop_grad = feature_input_stop_grad
+        self.edge_ring = edge_ring
 
     def prepare_feature_input(self, image: torch.Tensor, depth: torch.Tensor) -> torch.Tensor:
         """Prepare the feature input to the Guassian predictor."""
@@ -206,7 +216,9 @@ class MultiLayerInitializer(nn.Module):
             disparity = torch.cat([first_disparity, following_disparity], dim=2)
 
         # Prepare base values.
-        base_x_ndc, base_y_ndc = _create_base_xy(depth, self.stride, self.num_layers)
+        base_x_ndc, base_y_ndc = _create_base_xy(
+            depth, self.stride, self.num_layers, edge_ring=self.edge_ring
+        )
         disparity_scale_factor = 2 * self.scale_factor * self.stride / float(image_width)
         base_scales = _create_base_scale(disparity, disparity_scale_factor)
 
@@ -254,15 +266,40 @@ class MultiLayerInitializer(nn.Module):
 
 
 def _create_base_xy(
-    depth: torch.Tensor, stride: int, num_layers: int
+    depth: torch.Tensor, stride: int, num_layers: int, edge_ring: bool = True
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Create base x and y coordinates for the gaussians in NDC space."""
+    """Create base x and y coordinates for the gaussians in NDC space.
+
+    When ``edge_ring`` is True (the default), the leftmost/topmost and
+    rightmost/bottommost columns and rows of the stride grid are snapped to
+    the true frame boundary (NDC -1.0 and +1.0), so sampling reaches the
+    pixel rim instead of stopping one pixel inside. Without this, every
+    frame edge carries a guaranteed empty strip of ~1 pixel — the "dark
+    fringe" that is most visible on close-up portraits. The total
+    row/column counts are unchanged, so all other base tensors (colours,
+    scales, opacities) keep the same shape. ``edge_ring=False`` restores the
+    original behaviour in which the first and last sampling points sit one
+    pixel inside the frame.
+    """
     device = depth.device
     batch_size, _, image_height, image_width = depth.shape
     xx = torch.arange(0.5 * stride, image_width, stride, device=device)
     yy = torch.arange(0.5 * stride, image_height, stride, device=device)
-    xx = 2 * xx / image_width - 1.0
-    yy = 2 * yy / image_height - 1.0
+    # Edge ring: snap the outermost samples to the pixel rim. The left/top
+    # samples move to pixel 0 (NDC -1.0) and the right/bottom to the last
+    # pixel (image_width/height - 1, i.e. NDC 1.0 - 2/image_size in their
+    # dimension). This closes the one-pixel "dark fringe" that the original
+    # grid left empty at every frame edge, which is the band that reads as
+    # tearing/loss on the silhouette of close-up portraits.
+    if edge_ring:
+        if xx.numel() > 0:
+            xx[0] = 0.0
+            xx[-1] = image_width - 1.0
+        if yy.numel() > 0:
+            yy[0] = 0.0
+            yy[-1] = image_height - 1.0
+    xx = 2.0 * xx / image_width - 1.0
+    yy = 2.0 * yy / image_height - 1.0
 
     xx, yy = torch.meshgrid(xx, yy, indexing="xy")
     base_x_ndc = xx[None, None, None].repeat(batch_size, 1, num_layers, 1, 1)

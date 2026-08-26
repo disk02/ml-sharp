@@ -28,6 +28,33 @@ def _get_scale_activation_constant(max_scale: float, min_scale: float) -> tuple[
     return constant_a, constant_b
 
 
+def _build_edge_mask(
+    h: int,
+    w: int,
+    n_cells: int,
+    device,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Build a per-cell frame-edge mask of shape ``[h, w]``.
+
+    A cell ``1`` means its centre sits within ``n_cells`` cells of at least
+    one frame edge (top / bottom / left / right). Used as a per-cell mask to
+    gate the close-up veil (Defects 2+3). For interior cells the mask is
+    exactly 0 so the original mapping is preserved exactly for the far
+    majority of the frame.
+    """
+    ys = torch.arange(h, device=device, dtype=dtype)
+    xs = torch.arange(w, device=device, dtype=dtype)
+    yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+    # A cell is "edge" if the index on either end is smaller than n_cells.
+    top = (yy < n_cells).to(dtype)
+    bottom = ((h - 1 - yy) < n_cells).to(dtype)
+    left = (xx < n_cells).to(dtype)
+    right = ((w - 1 - xx) < n_cells).to(dtype)
+    mask = torch.max(torch.max(torch.max(top, bottom), left), right)
+    return mask
+
+
 class GaussianComposer(nn.Module):
     """Converts base values and deltas into Gaussians."""
 
@@ -44,6 +71,8 @@ class GaussianComposer(nn.Module):
         color_space: ColorSpace,
         base_scale_on_predicted_mean: bool,
         scale_factor: int = 1,
+        stride: int = 0,
+        edge_params=None,
     ) -> None:
         """Initialize GaussianComposer.
 
@@ -56,6 +85,11 @@ class GaussianComposer(nn.Module):
             color_space: Which color space is used in training.
             scale_factor: The scale factor to upsample the delta_values before composition.
             base_scale_on_predicted_mean: Whether to account z offsets for estimating base scale.
+            stride: The initializer's downsampling stride (pixels per grid cell).
+                Used to build the per-cell frame-edge mask for the close-up
+                veil (Defects 2+3). ``0`` disables the mask (original behaviour).
+            edge_params: An ``EdgeCoverParams`` instance controlling the frame-edge
+                veil. ``None`` disables the veil entirely (original behaviour).
         """
         super().__init__()
         self.delta_factor = delta_factor
@@ -66,6 +100,8 @@ class GaussianComposer(nn.Module):
         self.color_space = color_space
         self.scale_factor = scale_factor
         self.base_scale_on_predicted_mean = base_scale_on_predicted_mean
+        self.stride = stride
+        self.edge_params = edge_params
 
     def upsample_delta_value(self, delta: torch.Tensor, scale_factor: int = 1):
         """Upsample the delta value.
@@ -88,6 +124,31 @@ class GaussianComposer(nn.Module):
             scale_factor=scale_factor,
         ).view(batch_size, num_channels, num_layers, new_height, new_width)
         return upsampled_delta
+
+    def _edge_veil_mask(self, base_values: GaussianBaseValues) -> torch.Tensor | None:
+        """Build the per-cell edge mask for the veil (or None when disabled).
+
+        Returns a tensor of shape ``[B, 1, L, H, W]`` broadcastable to the
+        delta tensors. Every interior cell is exactly 0 so the original
+        mapping is preserved exactly for the far majority of the frame.
+        """
+        if self.edge_params is None or not getattr(self.edge_params, "enabled", False):
+            return None
+        px = int(getattr(self.edge_params, "px", 1))
+        if px <= 0:
+            return None
+        if stride := self.stride:
+            n_cells = max(1, px // stride)  # round down; at least one ring
+        else:
+            n_cells = px
+        h, w = base_values.mean_x_ndc.shape[-2:]
+        mask = _build_edge_mask(
+            h, w, n_cells, base_values.mean_x_ndc.device, base_values.mean_x_ndc.dtype
+        )
+        # Broadcast to [B, 1, L, H, W].
+        return mask[None, None, None, :, :].repeat(
+            base_values.mean_x_ndc.shape[0], 1, base_values.mean_x_ndc.shape[2], 1, 1
+        )
 
     def forward(
         self,
@@ -131,6 +192,20 @@ class GaussianComposer(nn.Module):
         quaternions = self._quaternion_activation(base_values.quaternions, delta[:, 6:10])
         colors = self._color_activation(base_values.colors, delta[:, 10:13])
         opacities = self._opacity_activation(base_values.opacities, delta[:, 13])
+
+        # ---- Defects 2+3: close-up veil on the frame edge. ----
+        # Only apply when edge_params is set (or self.edge_params is enabled).
+        # We pre-scale singular_values by (1 + (veil_scale-1)*mask) and
+        # then pre-scale opacities by (1 + (veil_alpha-1)*mask). Interior
+        # cells (mask==0) see no change so the original mapping is preserved
+        # exactly. Veil is gated by ``enabled``, so disabling is a no-op
+        # that bitwise-matches the original code path.
+        veil_mask = self._edge_veil_mask(base_values)
+        if veil_mask is not None:
+            veil_scale = float(getattr(self.edge_params, "veil_scale", 1.0))
+            veil_alpha = float(getattr(self.edge_params, "veil_alpha", 1.0))
+            singular_values = singular_values * (1.0 + (veil_scale - 1.0) * veil_mask)
+            opacities = opacities * (1.0 + (veil_alpha - 1.0) * veil_mask)
 
         if flatten_output:
             # [B, C, N, H, W] -> [B, N, H, W, C].

@@ -29,6 +29,7 @@ from sharp.models import (
     RGBGaussianPredictor,
     create_predictor,
 )
+from sharp.models.params import EdgeCoverParams
 from sharp.utils import camera
 from sharp.utils import io
 from sharp.utils import logging as logging_utils
@@ -412,6 +413,30 @@ def resolve_focal_length_mm(
         "Rendering/saving is still per-image."
     ),
 )
+@click.option(
+    "--edge-cover",
+    type=str,
+    default="on",
+    show_default=True,
+    help=(
+        "Close-up frame-edge coverage (edge-ring snap + scale veil). "
+        "'on' enables, 'off' is a complete backout."
+    ),
+)
+@click.option(
+    "--edge-veil-scale",
+    type=float,
+    default=1.15,
+    show_default=True,
+    help="Splat scale inflation (x) applied inside the frame-edge veil.",
+)
+@click.option(
+    "--edge-veil-alpha",
+    type=float,
+    default=0.25,
+    show_default=True,
+    help="Splat opacity ramp applied inside the veil (lower = fainter edge veil).",
+)
 @click.option("-v", "--verbose", is_flag=True, help="Activate debug logs.")
 def predict_cli(
     input_path: Path,
@@ -443,7 +468,10 @@ def predict_cli(
     amp_dtype: str,
     batch_size: int,
     verbose: bool,
-):
+    edge_cover: str,
+    edge_veil_scale: float,
+    edge_veil_alpha: float,
+    ):
     """Predict Gaussians from input images."""
     logging_utils.configure(logging.DEBUG if verbose else logging.INFO)
 
@@ -537,7 +565,13 @@ def predict_cli(
         LOGGER.info("Loading checkpoint from %s", checkpoint_path)
         state_dict = torch.load(checkpoint_path, weights_only=True)
 
-    gaussian_predictor = create_predictor(PredictorParams())
+    predictor_params = PredictorParams()
+    predictor_params.edge_cover = EdgeCoverParams(
+        enabled=edge_cover == "on",
+        veil_scale=edge_veil_scale,
+        veil_alpha=edge_veil_alpha,
+    )
+    gaussian_predictor = create_predictor(predictor_params)
     gaussian_predictor.load_state_dict(state_dict)
     gaussian_predictor.eval()
     gaussian_predictor.to(device)

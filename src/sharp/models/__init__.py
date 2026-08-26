@@ -37,6 +37,8 @@ def create_predictor(params: PredictorParams) -> RGBGaussianPredictor:
         color_space=params.color_space,
         scale_factor=scale_factor,
         base_scale_on_predicted_mean=params.base_scale_on_predicted_mean,
+        stride=params.initializer.stride,
+        edge_params=params.edge_cover,
     )
     if params.num_monodepth_layers > 1 and params.initializer.num_layers != 2:
         raise KeyError("We only support num_layers = 2 when num_monodepth_layers > 1.")

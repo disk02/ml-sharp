@@ -67,6 +67,48 @@ class DeltaFactor:
 
 
 @dataclasses.dataclass
+class EdgeCoverParams:
+    """Parameters for the close-up edge-coverage fix.
+
+    The initializer samples splats on a stride grid whose outermost ring sits
+    0.5*stride from the image boundary — an explicit uncoverage strip at the
+    edge of the frame. In close-up portraits, that strip is the silhouette's
+    rim, where splats "tear" at the edge. Complementary mechanisms to close
+    the gap:
+
+      1. The initializer snaps the outermost sampling ring onto the frame
+         boundary, extending coverage all the way to the edge (pure geometry,
+         no mask).
+      2. The composer inflates the splat scale of the outermost ``px`` pixels
+         around the frame (soft veil), so even if the face volume turns away
+         in orbit, the edge retains translucent coverage.
+      3. The same veil softens opacity by ``veil_alpha`` so that the extra
+         footprint from the scale inflation does not become a doubled stack of
+         pixel density.
+
+    Set ``enabled=False`` (or ``px=0``) to precisely restore the original
+    behavior.
+    """
+
+    # Master gate for all edge-coverage effects.
+    enabled: bool = True
+
+    # Width of the frame-edge strip on which splats get the veil treatment
+    # (in pixels). Set to 0 for no veil.
+    px: int = 2
+
+    # Scale inflation multiplier applied to splats in the outermost frame
+    # ring (soft veil). Keeps the ring's footprint in view even if the face
+    # volume turns away in orbit.
+    veil_scale: float = 1.15
+
+    # Alpha multiplier for the veil. With veil_scale > 1 this is less than 1.0
+    # (i.e. dimmed); with veil_scale < 1 this is greater than 1.0 (i.e.
+    # strengthened).
+    veil_alpha: float = 0.25
+
+
+@dataclasses.dataclass
 class InitializerParams:
     """Parameters for initializer."""
 
@@ -100,6 +142,9 @@ class InitializerParams:
     set_uninpainted_opacity_to_zero: bool = False
     # Whether to concatenate the inpainting mask to the feature input.
     concat_inpainting_mask: bool = False
+
+    # Edge-coverage parameters (Defect 1: append true-edge sampling rings).
+    edge_cover: EdgeCoverParams = dataclasses.field(default_factory=EdgeCoverParams)
 
 
 @dataclasses.dataclass
@@ -201,3 +246,5 @@ class PredictorParams:
     sorting_monodepth: bool = False
     # Whether to account the z offsets for estimating base scale.
     base_scale_on_predicted_mean: bool = True
+    # Edge-coverage parameters (Defects 2+3: veil / opacity at the frame edge).
+    edge_cover: EdgeCoverParams = dataclasses.field(default_factory=EdgeCoverParams)
