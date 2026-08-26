@@ -128,6 +128,18 @@ def test_edge_veil_scales_and_dims_border() -> None:
     opacity_diff = (alpha_ratio - 1.0).abs()
     assert (opacity_diff[..., inner] < 1e-7).all()
 
+    # Regression guard for the prune stage: the opacities flat count must match
+    # the singular_values flat count (else (opacities>=min_op) & (max_scale>=min)
+    # splits). The old 5-D veil mask broadcast opacities to an extra batch dim.
+    on_f = _composer(e)(torch.zeros(1, 14, num_layers, rows, cols), bv)  # flatten_output=True
+    off_f = _composer(None)(torch.zeros(1, 14, num_layers, rows, cols), bv)
+    op_cells = on_f.opacities.shape[-2] * on_f.opacities.shape[-1] * on_f.opacities.shape[0]
+    sv_cells = on_f.singular_values.shape[:-1].numel()
+    assert op_cells == sv_cells, f"opacities {op_cells} != singular {sv_cells}"
+    # And identical when off.
+    _fin = off_f.opacities.shape[-2] * off_f.opacities.shape[-1] * off_f.opacities.shape[0]
+    assert _fin == on_f.singular_values.shape[:-1].numel()
+
 
 def test_edge_veil_disabled_is_noop() -> None:
     num_layers, rows, cols = 2, 6, 8

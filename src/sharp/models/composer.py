@@ -142,12 +142,14 @@ class GaussianComposer(nn.Module):
         else:
             n_cells = px
         h, w = base_values.mean_x_ndc.shape[-2:]
-        mask = _build_edge_mask(
+        # Return the pure 2-D [H, W] spatial mask. It broadcasts onto both the
+        # channel-carrying tensors  (B, C, L, H, W -> singular_values / mean)
+        # AND the opacity tensor (B, L, H, W), which has no channel dim. A mask
+        # expanded to [B, 1, L, H, W] would broadcast opacities to
+        # [B, B, L, H, W] and leave a stray dim after flatten, which is exactly
+        # what the prune stage rejects -- so keep it at [H, W].
+        return _build_edge_mask(
             h, w, n_cells, base_values.mean_x_ndc.device, base_values.mean_x_ndc.dtype
-        )
-        # Broadcast to [B, 1, L, H, W].
-        return mask[None, None, None, :, :].repeat(
-            base_values.mean_x_ndc.shape[0], 1, base_values.mean_x_ndc.shape[2], 1, 1
         )
 
     def forward(
